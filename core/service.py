@@ -1088,19 +1088,15 @@ class QzoneService(BaseService):
                 tag="[点赞说说]",
                 max_retries=2,
             )
-            text = resp.text.strip()
-            if text.startswith("_Callback("):
-                text = text[len("_Callback("):]
-            if text.endswith(")"):
-                text = text[:-1]
+            text = self._normalize_callback_payload(resp.text)
 
             try:
                 data = orjson.loads(text)
             except Exception:
-                if "succ" in text or "成功" in text:
+                if "succ" in text.lower() or "成功" in text or '"ret":0' in text or '"code":0' in text:
                     logger.info("[点赞说说] 成功 (无法解析JSON)")
                     return Result.ok("点赞成功 (无法解析JSON)")
-                logger.error("[点赞说说] 响应解析失败")
+                logger.error(f"[点赞说说] 响应解析失败, snippet={repr(text[:200])}")
                 return Result.fail("点赞响应解析失败")
 
             code = data.get("ret", data.get("code", -1))
@@ -1145,11 +1141,7 @@ class QzoneService(BaseService):
                 tag="[重试点赞]",
                 max_retries=1,
             )
-            text = resp.text.strip()
-            if text.startswith("_Callback("):
-                text = text[len("_Callback("):]
-            if text.endswith(")"):
-                text = text[:-1]
+            text = self._normalize_callback_payload(resp.text)
             data = orjson.loads(text)
             code = data.get("ret", data.get("code", -1))
             if code == 0:

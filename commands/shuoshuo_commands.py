@@ -10,6 +10,7 @@ from __future__ import annotations
 import datetime
 import inspect
 import random
+import time
 from collections import Counter
 from typing import TYPE_CHECKING
 
@@ -38,6 +39,45 @@ class SendFeedCommand(BaseCommand):
         "此刻的一点灵感",
     )
     _RANDOM_KEYWORDS: tuple[str, ...] = ("随机", "random", "rand")
+    _IDEMPOTENT_WINDOW_SECONDS: float = 2.5
+
+    def _get_idempotent_cache(self) -> dict[str, float]:
+        """获取插件级短窗幂等缓存。
+
+        说明：
+        - 缓存挂载在插件实例上，避免跨插件/跨测试污染。
+        - 仅做内存态短窗去重，不做持久化。
+        """
+        cache = getattr(self.plugin, "_send_feed_recent_requests", None)
+        if isinstance(cache, dict):
+            return cache
+
+        cache = {}
+        setattr(self.plugin, "_send_feed_recent_requests", cache)
+        return cache
+
+    def _build_idempotent_key(self, *, raw_topic: str, topic: str, used_random_seed: bool) -> str:
+        """构造幂等键。"""
+        seed = "random" if used_random_seed else (raw_topic or topic)
+        normalized_seed = " ".join(str(seed).strip().lower().split())
+        return f"{self.stream_id}|{normalized_seed}"
+
+    def _is_duplicate_request(self, *, key: str) -> bool:
+        """判断是否为短时间重复请求（非阻塞）。"""
+        now = time.monotonic()
+        cache = self._get_idempotent_cache()
+
+        expire_before = now - self._IDEMPOTENT_WINDOW_SECONDS
+        expired_keys = [k for k, ts in cache.items() if ts < expire_before]
+        for expired_key in expired_keys:
+            cache.pop(expired_key, None)
+
+        last_time = cache.get(key)
+        if last_time is not None and (now - last_time) <= self._IDEMPOTENT_WINDOW_SECONDS:
+            return True
+
+        cache[key] = now
+        return False
 
     def _build_random_seed(self) -> str:
         """构造随机发布灵感。"""
@@ -51,6 +91,14 @@ class SendFeedCommand(BaseCommand):
         if (not topic) or (normalized in self._RANDOM_KEYWORDS):
             topic = self._build_random_seed()
             used_random_seed = True
+
+        idem_key = self._build_idempotent_key(
+            raw_topic=raw_topic,
+            topic=topic,
+            used_random_seed=used_random_seed,
+        )
+        if self._is_duplicate_request(key=idem_key):
+            return True, "检测到短时间内重复发送请求，已忽略本次触发。"
 
         from src.app.plugin_system.api.send_api import send_text
         preview_topic = "随机" if used_random_seed else raw_topic

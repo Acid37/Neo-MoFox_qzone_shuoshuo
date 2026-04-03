@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from typing import Annotated, Any
 
 from src.core.components.base import BaseAction
@@ -21,7 +22,10 @@ class ReadShuoshuoAction(BaseAction):
     action_description = (
         "前往QQ空间阅读/浏览说说内容。\n"
         "获取指定用户的说说列表，供 AI 分析和决策后续操作（评论、点赞等）。\n"
-        "注意：默认只阅读；但当最近用户消息中明确要求点赞/评论时，本动作会在阅读后自动补执行要求的互动部分，避免流程中断。\n"
+        "注意：本动作采用‘规则优先 + 概率兜底’策略。\n"
+        "- 用户明确要求（只读/只点赞/只评论）优先\n"
+        "- 未明确要求时，按兴趣与概率决定是否继续互动\n"
+        "- 无论是否互动，都会返回任务总结\n"
         "参数说明：\n"
         "- qq_number: QQ号（可选），留空则查看 Bot 自己的说说\n"
         "- count: 获取数量（可选），默认 10 条\n"
@@ -35,6 +39,9 @@ class ReadShuoshuoAction(BaseAction):
     _LIKE_INTENT_KEYWORDS = ("点赞", "点个赞", "赞一下", "点个❤️", "点个❤")
     _COMMENT_INTENT_KEYWORDS = ("评论", "回复", "回一句", "回一下", "夸夸")
     _INTERACT_INTENT_KEYWORDS = ("互动", "回他", "理他", "搭话")
+    _READ_ONLY_KEYWORDS = ("只读", "仅阅读", "先看看", "先看", "不要互动", "不互动")
+    _NO_LIKE_KEYWORDS = ("别点赞", "不要点赞", "不点赞", "别点", "不要点")
+    _NO_COMMENT_KEYWORDS = ("别评论", "不要评论", "不评论", "别回", "不要回")
 
     def _get_plugin_config(self) -> Any:
         """获取插件配置"""
@@ -73,24 +80,80 @@ class ReadShuoshuoAction(BaseAction):
 
         return ""
 
-    def _detect_interaction_intent(self) -> tuple[bool, bool, bool, str]:
-        """检测最近用户消息中的互动意图。
-
-        Returns:
-            tuple[bool, bool, bool, str]:
-            (是否需要互动, 是否需要点赞, 是否需要评论, 触发文本)
-        """
+    def _resolve_interaction_plan(
+        self,
+        *,
+        service: Any,
+        item: dict[str, Any],
+    ) -> tuple[bool, bool, str, str]:
+        """解析互动计划：规则优先，概率兜底。"""
         text = self._extract_recent_user_text()
-        if not text:
-            return False, False, False, ""
+        normalized = text.replace(" ", "") if text else ""
 
-        normalized = text.replace(" ", "")
         want_like = any(kw in normalized for kw in self._LIKE_INTENT_KEYWORDS)
         want_comment = any(kw in normalized for kw in self._COMMENT_INTENT_KEYWORDS)
-        weak_interact = any(kw in normalized for kw in self._INTERACT_INTENT_KEYWORDS)
-        want_interact = bool(want_like or want_comment or weak_interact)
+        want_interact = any(kw in normalized for kw in self._INTERACT_INTENT_KEYWORDS)
 
-        return want_interact, want_like, want_comment, text
+        no_like = any(kw in normalized for kw in self._NO_LIKE_KEYWORDS)
+        no_comment = any(kw in normalized for kw in self._NO_COMMENT_KEYWORDS)
+        read_only = any(kw in normalized for kw in self._READ_ONLY_KEYWORDS)
+
+        if read_only:
+            return False, False, text, "explicit_read_only"
+
+        has_explicit = bool(want_like or want_comment or no_like or no_comment)
+        if has_explicit:
+            like_plan: bool | None = None
+            comment_plan: bool | None = None
+
+            if want_like:
+                like_plan = True
+            if want_comment:
+                comment_plan = True
+            if no_like:
+                like_plan = False
+            if no_comment:
+                comment_plan = False
+
+            # 有明确信号时，未指定项默认关闭（避免过度执行）
+            return bool(like_plan), bool(comment_plan), text, "explicit_intent"
+
+        monitor_cfg = getattr(service, "config", None)
+        monitor_section = getattr(monitor_cfg, "monitor", None) if monitor_cfg else None
+        like_prob = float(getattr(monitor_section, "like_probability", 0.8)) if monitor_section else 0.8
+        comment_prob = float(getattr(monitor_section, "comment_probability", 0.3)) if monitor_section else 0.3
+        like_prob = max(0.0, min(1.0, like_prob))
+        comment_prob = max(0.0, min(1.0, comment_prob))
+
+        interest = self._estimate_interest_score(user_text=text, item=item)
+        bonus = 0.15 if interest >= 0.65 else (-0.15 if interest <= 0.35 else 0.0)
+        like_prob = max(0.0, min(1.0, like_prob + bonus))
+        comment_prob = max(0.0, min(1.0, comment_prob + bonus))
+
+        if want_interact:
+            like_prob = max(like_prob, 0.7)
+            comment_prob = max(comment_prob, 0.5)
+
+        do_like = random.random() <= like_prob
+        do_comment = random.random() <= comment_prob
+        return do_like, do_comment, text, f"probability(interest={interest:.2f},like={like_prob:.2f},comment={comment_prob:.2f})"
+
+    def _estimate_interest_score(self, *, user_text: str, item: dict[str, Any]) -> float:
+        """估算兴趣分，用于概率决策微调。"""
+        score = 0.5
+        content = str(item.get("content", "") or "")
+        normalized_user = user_text.replace(" ", "")
+
+        if any(k in normalized_user for k in ("喜欢", "感兴趣", "想聊", "想回", "有意思")):
+            score += 0.2
+        if len(content) >= 30:
+            score += 0.1
+        if any(k in content for k in ("！", "?", "？", "❤️", "❤", "😊", "😄")):
+            score += 0.1
+        if not content:
+            score -= 0.15
+
+        return max(0.0, min(1.0, score))
 
     async def _build_comment_text_for_auto_interaction(self, service: Any, item: dict[str, Any]) -> str:
         """构造自动互动评论文本，优先调用服务层 AI 生成。"""
@@ -111,26 +174,31 @@ class ReadShuoshuoAction(BaseAction):
         return default_text
 
     async def _auto_interact_if_requested(self, service: Any, item: dict[str, Any]) -> list[str]:
-        """在检测到明确互动意图时，自动补执行点赞/评论。"""
+        """阅读后执行互动决策，并始终返回任务总结。"""
         lines: list[str] = []
-        want_interact, want_like, want_comment, intent_text = self._detect_interaction_intent()
-        if not want_interact:
-            return lines
+        want_like, want_comment, intent_text, decision_reason = self._resolve_interaction_plan(
+            service=service,
+            item=item,
+        )
 
         tid = str(item.get("tid", "") or "").strip()
         owner_qq = str(item.get("uin", "") or "").strip() or None
+
+        like_status = "skip"
+        comment_status = "skip"
+
         if not tid:
-            lines.append("【流程守卫】检测到互动意图，但当前说说缺少 tid，无法自动补执行。")
+            lines.append("【流程守卫】当前说说缺少 tid，无法执行互动。")
+            lines.append(
+                f"【任务总结】read=1, like={like_status}, comment={comment_status}, reason={decision_reason}"
+            )
             return lines
 
-        # 仅出现泛互动词（如“互动一下”）时，默认执行点赞 + 评论闭环。
-        if not want_like and not want_comment:
-            want_like = True
-            want_comment = True
-
-        lines.append("【流程守卫】interaction_required=true")
-        lines.append(f"【用户意图】{intent_text}")
-        lines.append("【下一轮约束】互动已被用户明确要求：请先汇报本轮互动结果，再决定是否继续下一批。")
+        lines.append(f"【流程守卫】interaction_required={str(want_like or want_comment).lower()}")
+        if intent_text:
+            lines.append(f"【用户意图】{intent_text}")
+        lines.append(f"【决策依据】{decision_reason}")
+        lines.append("【下一轮约束】请先汇报本轮互动结果，再决定是否继续下一批。")
 
         if want_like:
             like_result = await service.like_shuoshuo(
@@ -139,8 +207,10 @@ class ReadShuoshuoAction(BaseAction):
                 owner_qq=owner_qq,
             )
             if getattr(like_result, "is_success", False):
+                like_status = "ok"
                 lines.append(f"【自动补执行】点赞已完成 tid={tid}")
             else:
+                like_status = "fail"
                 err = str(getattr(like_result, "error_message", "未知错误") or "未知错误")
                 lines.append(f"【自动补执行】点赞失败 tid={tid}, reason={err}")
 
@@ -154,11 +224,17 @@ class ReadShuoshuoAction(BaseAction):
                 comment_id=None,
             )
             if getattr(comment_result, "is_success", False):
+                comment_status = "ok"
                 lines.append(f"【自动补执行】评论已完成 tid={tid}")
             else:
+                comment_status = "fail"
                 err = str(getattr(comment_result, "error_message", "未知错误") or "未知错误")
                 lines.append(f"【自动补执行】评论失败 tid={tid}, reason={err}")
 
+        lines.append(
+            f"【任务总结】read=1, like={like_status if want_like else 'skip'}, "
+            f"comment={comment_status if want_comment else 'skip'}, reason={decision_reason}"
+        )
         lines.append("【执行回执】task=interaction_followup,status=done_or_attempted")
         return lines
 
@@ -291,7 +367,7 @@ class ReadShuoshuoAction(BaseAction):
                 lines.append(f"我看到的重点大概是：{'；'.join(preview_list)}")
             lines.append("【执行回执】task=read_shuoshuo,status=step_done")
             lines.append("【流程状态】workflow=interaction_pending_if_requested")
-            lines.append("【流程守卫】interaction_required=false,report_required=true")
+            lines.append("【流程守卫】interaction_required=true,report_required=true")
             lines.append("【下一轮约束】请先向用户汇报本次阅读结论；在未完成汇报前，禁止重复调用 read_shuoshuo。")
             lines.append("【下一轮上下文】我刚刚已经完成“阅读说说”；如果用户要求互动，本任务仍未完成，必须继续调用 comment_shuoshuo 或 like_shuoshuo，而不是重复 read_shuoshuo。")
 
