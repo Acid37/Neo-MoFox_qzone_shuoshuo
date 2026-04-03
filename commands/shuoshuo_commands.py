@@ -37,20 +37,23 @@ class SendFeedCommand(BaseCommand):
         "最近生活里的微小进展",
         "此刻的一点灵感",
     )
+    _RANDOM_KEYWORDS: tuple[str, ...] = ("随机", "random", "rand")
 
     def _build_random_seed(self) -> str:
         """构造随机发布灵感。"""
         return random.choice(self._RANDOM_SEEDS)
 
     async def execute(self, message_text: str) -> tuple[bool, str]:
-        topic = message_text.strip()
+        raw_topic = message_text.strip()
+        topic = raw_topic
         used_random_seed = False
-        if not topic:
+        normalized = topic.lower()
+        if (not topic) or (normalized in self._RANDOM_KEYWORDS):
             topic = self._build_random_seed()
             used_random_seed = True
 
         from src.app.plugin_system.api.send_api import send_text
-        preview_topic = "随机" if used_random_seed else topic
+        preview_topic = "随机" if used_random_seed else raw_topic
         try:
             await send_text(
                 content=f"收到！正在为你生成关于“{preview_topic}”的说说，请稍候...",
@@ -68,18 +71,17 @@ class SendFeedCommand(BaseCommand):
 
         result = await service.publish_shuoshuo(content=topic)
         if result.is_success:
-            tid = ""
+            published_content = ""
             if isinstance(result.data, dict):
-                tid = str(result.data.get("tid", "") or "")
+                published_content = str(result.data.get("content", "") or "").strip()
 
-            lines = ["✅ 说说发布成功！"]
-            if used_random_seed:
-                lines.append(f"本次使用随机灵感主题：{topic}")
-            else:
-                lines.append(f"本次主题：{topic}")
-            if tid:
-                lines.append(f"ID: {tid}")
-            return True, "\n".join(lines)
+            if not published_content:
+                published_content = str(topic or "").strip()
+
+            if published_content:
+                return True, f"已经成功发送说说：{published_content}"
+
+            return True, "已经成功发送说说。"
         return False, f"❌ 发布失败: {result.error_message}"
 
 

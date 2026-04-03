@@ -642,7 +642,11 @@ class QzoneService(BaseService):
 
             if result.get("tid"):
                 logger.info(f"[重试发布] 成功, tid={result['tid']}")
-                return Result.ok({"tid": result["tid"], "message": "发布成功（Cookie已刷新）"})
+                return Result.ok({
+                    "tid": result["tid"],
+                    "message": "发布成功（Cookie已刷新）",
+                    "content": content,
+                })
 
             logger.error(f"[重试发布] 失败: {result.get('message', '未知错误')}")
             return Result.fail(f"发布失败: {result.get('message', '未知错误')}")
@@ -780,7 +784,7 @@ class QzoneService(BaseService):
                     self._last_published_at = time.time()
                     self._remember_published_text(raw_text)
                 logger.info(f"[发布说说] 发布成功, tid={tid}")
-                return Result.ok({"tid": tid, "message": "发布成功"})
+                return Result.ok({"tid": tid, "message": "发布成功", "content": content})
             else:
                 error_msg = result.get('message', '未知错误')
                 logger.error(f"[发布说说] 发布失败: {error_msg}")
@@ -2231,19 +2235,21 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
             生成的评论文本，失败返回 None
         """
         try:
+            from src.app.plugin_system.api.llm_api import get_model_set_by_task
             from src.kernel.llm import LLMRequest, LLMPayload, ROLE, Text
 
             self._log("debug", "[AI评论]", "请求AI生成评论（完整提示词）...")
+            model_set = get_model_set_by_task("actor")
 
             # 调用 LLM
-            llm_request = LLMRequest(model_set="default")
+            llm_request = LLMRequest(model_set=model_set)
             if system_prompt:
                 llm_request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
             llm_request.add_payload(LLMPayload(ROLE.USER, Text(full_prompt)))
 
-            response = await llm_request.send()
-            if response and response.content:
-                comment = response.content.strip()
+            response = await llm_request.send(stream=False)
+            comment = str(getattr(response, "message", "") or "").strip()
+            if comment:
                 # 清理可能的引号包裹
                 if comment.startswith('"') and comment.endswith('"'):
                     comment = comment[1:-1]
@@ -2273,6 +2279,7 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
             生成的评论文本，失败返回 None
         """
         try:
+            from src.app.plugin_system.api.llm_api import get_model_set_by_task
             from src.kernel.llm import LLMRequest, LLMPayload, ROLE, Text
 
             # 构建用户提示词
@@ -2280,15 +2287,17 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
             user_prompt = user_prompt.replace("{nickname}", nickname)
 
             self._log("debug", "[AI评论]", f"请求AI生成评论, 内容: {content[:50]}...")
+            model_set = get_model_set_by_task("actor")
 
             # 调用 LLM
-            llm_request = LLMRequest(model_set="default")
+            llm_request = LLMRequest(model_set=model_set)
             llm_request.add_payload(LLMPayload(ROLE.SYSTEM, Text(system_prompt)))
             llm_request.add_payload(LLMPayload(ROLE.USER, Text(user_prompt)))
 
-            response = await llm_request.send()
-            if response and response.content:
-                return response.content.strip()
+            response = await llm_request.send(stream=False)
+            text = str(getattr(response, "message", "") or "").strip()
+            if text:
+                return text
         except Exception as e:
             self._log("warning", "[AI评论]", f"LLM调用失败: {e}")
         return None

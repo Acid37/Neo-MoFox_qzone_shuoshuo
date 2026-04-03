@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import random
 from typing import Any
 
 from src.app.plugin_system.api.log_api import get_logger
@@ -26,12 +28,16 @@ class QzoneCommandHandler(BaseEventHandler):
     """拦截并执行 qzone 命令。"""
 
     handler_name = "qzone_command_handler"
-    handler_description = "拦截 /send_feed 与 /read_feed 命令并直接执行。"
+    handler_description = "执行 /send_feed 与 /read_feed 命令，并放行后续消息流程。"
     weight = 200
-    intercept_message = True
+    intercept_message = False
     init_subscribe = [EventType.ON_MESSAGE_RECEIVED]
 
     _SUPPORTED_COMMANDS = {"send_feed", "read_feed"}
+
+    async def _delay_response_with_jitter(self) -> None:
+        """发送命令回执前增加扰动延时，降低固定节奏触发风控风险。"""
+        await asyncio.sleep(random.uniform(0.35, 1.2))
 
     def _extract_command_name(self, text: str) -> str | None:
         """提取命令名（去掉前缀 `/`）。"""
@@ -62,6 +68,7 @@ class QzoneCommandHandler(BaseEventHandler):
 
         # 仅处理 qzone 插件自身命令，避免误拦截其他插件
         if not command_cls:
+            await self._delay_response_with_jitter()
             await send_text(
                 content=(
                     "命令未识别，请检查格式：\n"
@@ -70,9 +77,8 @@ class QzoneCommandHandler(BaseEventHandler):
                 ),
                 stream_id=message.stream_id,
                 platform=message.platform,
-                reply_to=message.message_id,
             )
-            return EventDecision.STOP, params
+            return EventDecision.PASS, params
 
         signature = str(getattr(command_cls, "_signature_", "") or "")
         if not signature.startswith("qzone_shuoshuo:command:"):
@@ -84,19 +90,19 @@ class QzoneCommandHandler(BaseEventHandler):
             if not output:
                 output = "✅ 执行完成" if success else f"❌ 执行失败: {command_path or command_name}"
 
+            await self._delay_response_with_jitter()
             await send_text(
                 content=output,
                 stream_id=message.stream_id,
                 platform=message.platform,
-                reply_to=message.message_id,
             )
-            return EventDecision.STOP, params
+            return EventDecision.PASS, params
         except Exception as exc:
             logger.error(f"[命令处理] 执行失败: {exc}")
+            await self._delay_response_with_jitter()
             await send_text(
                 content=f"❌ 命令执行异常：{exc}",
                 stream_id=message.stream_id,
                 platform=message.platform,
-                reply_to=message.message_id,
             )
-            return EventDecision.STOP, params
+            return EventDecision.PASS, params
