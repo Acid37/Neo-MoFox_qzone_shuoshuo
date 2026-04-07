@@ -1416,8 +1416,13 @@ class QzoneService(BaseService):
         logger.warning("[Cookie更新] 未能获取 Cookie")
         return None
 
-    async def check_new_shuoshuo(self) -> None:
-        """检查并广播新说说（供内部/外部调用）"""
+    async def check_new_shuoshuo(self, *, force: bool = False, source: str = "scheduled") -> None:
+        """检查并广播新说说（供内部/外部调用）。
+
+        Args:
+            force: 是否强制执行。为 True 时跳过静默窗口/手动冷却检查。
+            source: 触发来源，仅用于日志标记。
+        """
         if not self._is_monitor_enabled():
             logger.debug("[说说监控] 监控总开关关闭，跳过")
             return
@@ -1429,14 +1434,17 @@ class QzoneService(BaseService):
 
         now_ts = time.time()
         cooldown_until = float(getattr(self, "_monitor_cooldown_until", 0.0) or 0.0)
-        if cooldown_until > now_ts:
+        if not force and cooldown_until > now_ts:
             remaining = int(cooldown_until - now_ts)
             logger.debug(f"[说说监控] 主动执行后冷却中，剩余约 {remaining}s，跳过本轮")
             return
 
-        if self._is_in_quiet_hours():
+        if not force and self._is_in_quiet_hours():
             logger.debug("[说说监控] 当前处于静默时间窗口，跳过本轮")
             return
+
+        if force:
+            logger.info(f"[说说监控] 强制执行本轮（source={source}），已跳过静默/冷却检查")
 
         current_qq = await self.get_current_uin()
         if not current_qq:
@@ -2413,6 +2421,15 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
             self._monitor_running = True
             logger.info(f"[自动监控] 已启动，间隔 {interval} 秒")
 
+            # 启动后立即执行一轮（最高优先级）：
+            # - 已在启动流程中重置冷却计时
+            # - 首轮强制执行，跳过静默/冷却检查
+            # - 已读/基线机制仍保留，避免历史刷屏
+            try:
+                await self._run_auto_monitor(force=True, source="startup_immediate")
+            except Exception as immediate_err:
+                logger.warning(f"[自动监控] 启动即执行首轮失败（已忽略，不影响后续定时监控）: {immediate_err}")
+
             return {
                 "success": True,
                 "message": f"监控已启动，间隔 {interval} 秒",
@@ -2445,10 +2462,10 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
             logger.error(f"[自动监控] 停止失败: {e}")
             return {"success": False, "message": str(e)}
 
-    async def _run_auto_monitor(self) -> None:
-        """执行自动监控任务"""
-        logger.debug("[自动监控] 开始检查新说说")
-        await self.check_new_shuoshuo()
+    async def _run_auto_monitor(self, *, force: bool = False, source: str = "scheduled") -> None:
+        """执行自动监控任务。"""
+        logger.debug(f"[自动监控] 开始检查新说说(force={force}, source={source})")
+        await self.check_new_shuoshuo(force=force, source=source)
 
     def _is_monitor_enabled(self) -> bool:
         """监控总开关是否开启。"""

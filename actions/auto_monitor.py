@@ -21,7 +21,8 @@ class AutoMonitorAction(BaseAction):
     action_name = "auto_monitor"
     action_description = (
         "自动监控 QQ 空间说说。\n"
-        "启动后会自动检测新说说并通知，可以配置自动评论和点赞（支持概率控制）。\n"
+        "启动后会立即尝试执行一轮监控，随后按间隔自动检测新说说并通知；"
+        "可配置自动评论和点赞（支持概率控制）。\n"
         "\n"
         "【重要约束】\n"
         "1. 自动评论是说给所有好友看的，内容必须适合所有人群。\n"
