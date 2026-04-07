@@ -19,6 +19,9 @@
     - **现状**：监控逻辑通过内部私有循环或 Action 触发。
     - **建议**：将 `check_new_shuoshuo` 注册为框架层级的 `Job`。这样可以利用框架自带的 **任务可视化管理** 和 **失败回退机制**，且不再阻塞插件的卸载流程。
 - [ ] **全面接入 `TaskManager`**：确保 VLM 图片识别等耗时异步任务都通过 `get_task_manager().create_task` 运行，规避“僵尸协程”风险。
+- [ ] **低优先级：监控间隔随机抖动（Anti-Detection Jitter）**：
+    - **目标**：在固定 `interval` 基础上增加小幅随机抖动（如 ±10%），降低请求节奏过于规律导致的风控概率。
+    - **备注**：当前优先级不高，待核心稳定性项完成后再实现。
 
 #### 3. 健壮性与类型契约 (Robustness & Type Contract)
 - [ ] **Pydantic 数据模型化**：
@@ -100,7 +103,7 @@ LLM 可以通过以下动作与插件交互：
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `action_type` | str | 必填 | start/stop/status |
-| `interval` | int | 300 | 监控间隔（秒） |
+| `interval` | int | `monitor.default_interval`（默认1800） | 监控间隔（秒） |
 | `target_group` | str | - | 推送群号 |
 | `target_user` | str | - | 推送QQ号 |
 | `auto_comment` | bool | false | 是否自动评论 |
@@ -245,7 +248,7 @@ qzone_shuoshuo/
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `enabled` | `true` | 监控总开关，关闭后不允许启动自动监控 |
-| `default_interval` | `5400` | 默认监控间隔（秒），当未传 `interval` 时生效，范围 60-86400 |
+| `default_interval` | `300` | 默认监控间隔（秒），当未传 `interval` 时生效，范围 60-86400 |
 | `like_probability` | `0.8` | 点赞概率 (0.0-1.0)，0.8=80% |
 | `comment_probability` | `0.3` | 评论概率 (0.0-1.0)，0.3=30% |
 | `enable_auto_reply_comments` | `true` | 是否自动回复自己说说下的评论 |
@@ -257,6 +260,7 @@ qzone_shuoshuo/
 > 行为说明：
 > - 自动回复评论会跟随“自动评论”开关：关闭自动评论时，不会执行自动回复评论。
 > - 手动执行 `/read_feed` 会重置自动监控计时，避免刚手动读完又立刻触发一轮自动执行。
+> - 首次启动自动监控时会先建立“最新动态基线”（记录当前最新 `tid`），不会补推历史动态；后续新动态才会触发通知/互动。
 
 #### AI 上下文策略（无 `[prompt]` 配置节）
 > 评论/回复/发布改写提示词已全部内置，统一由插件注入到 LLM 上下文，不再开放 TOML 配置项。

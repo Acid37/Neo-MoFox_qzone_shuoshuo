@@ -2308,9 +2308,21 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
         if comment_prob is None and monitor_cfg:
             comment_prob = getattr(monitor_cfg, "comment_probability", 0.3)
 
+        quiet_enabled = bool(getattr(monitor_cfg, "quiet_hours_enabled", True)) if monitor_cfg else True
+        quiet_start = int(getattr(monitor_cfg, "quiet_hours_start", 23) or 23) if monitor_cfg else 23
+        quiet_end = int(getattr(monitor_cfg, "quiet_hours_end", 7) or 7) if monitor_cfg else 7
+        quiet_start = max(0, min(quiet_start, 23))
+        quiet_end = max(0, min(quiet_end, 23))
+
+        now_ts = time.time()
+        cooldown_until = float(getattr(self, "_monitor_cooldown_until", 0.0) or 0.0)
+        cooldown_remaining = max(0, int(cooldown_until - now_ts))
+        baseline_tid = str(getattr(self, "_last_tid", "") or "").strip()
+
         return {
             "is_running": self._monitor_running,
             "enabled": monitor_enabled,
+            "default_interval": default_interval,
             "interval": self._monitor_config.get("interval", default_interval),
             "target_group": self._monitor_config.get("target_group", ""),
             "target_user": self._monitor_config.get("target_user", ""),
@@ -2318,6 +2330,12 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
             "auto_like": self._monitor_config.get("auto_like", False),
             "like_probability": like_prob or 1.0,
             "comment_probability": comment_prob or 0.3,
+            "quiet_hours_enabled": quiet_enabled,
+            "quiet_window": f"{quiet_start:02d}:00-{quiet_end:02d}:00",
+            "in_quiet_hours": self._is_in_quiet_hours(),
+            "cooldown_remaining_seconds": cooldown_remaining,
+            "baseline_initialized": bool(baseline_tid),
+            "last_tid": baseline_tid,
         }
 
     async def start_monitor(self, config: dict[str, Any]) -> dict[str, Any]:

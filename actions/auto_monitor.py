@@ -30,7 +30,7 @@ class AutoMonitorAction(BaseAction):
         "\n"
         "参数说明：\n"
         "- action_type: 操作类型（必填）。start=启动监控, stop=停止监控, status=查看状态\n"
-        "- interval: 监控间隔秒数（可选），仅 start 时有效，默认 300 秒\n"
+        "- interval: 监控间隔秒数（可选），仅 start 时有效；未传则使用配置 monitor.default_interval\n"
         "- target_group: 通知推送群号（可选）\n"
         "- target_user: 通知推送QQ号（可选）\n"
         "- auto_comment: 是否自动评论（可选），true/false\n"
@@ -118,11 +118,24 @@ class AutoMonitorAction(BaseAction):
         """查看监控状态"""
         try:
             status = await service.get_monitor_status()
+            monitor_enabled = bool(status.get("enabled", True))
+            in_quiet_hours = bool(status.get("in_quiet_hours", False))
+            cooldown_seconds = int(status.get("cooldown_remaining_seconds", 0) or 0)
+            baseline_initialized = bool(status.get("baseline_initialized", False))
             if status.get("is_running"):
                 lines = [
                     "📡 自动监控状态：运行中",
                     f"   间隔：{status.get('interval', 300)} 秒",
                 ]
+                quiet_window = str(status.get("quiet_window", "") or "")
+                if quiet_window:
+                    lines.append(f"   静默窗口：{quiet_window}")
+                lines.append(f"   当前时段：{'静默中（跳过执行）' if in_quiet_hours else '可执行'}")
+                if cooldown_seconds > 0:
+                    lines.append(f"   手动触发冷却：剩余约 {cooldown_seconds} 秒")
+                lines.append(f"   首次基线：{'已建立' if baseline_initialized else '未建立（首次轮询仅记录最新动态）'}")
+                if not monitor_enabled:
+                    lines.append("   监控总开关：关闭（配置 monitor.enabled=false）")
                 if status.get("target_group"):
                     lines.append(f"   推送群：{status.get('target_group')}")
                 if status.get("target_user"):
@@ -135,7 +148,18 @@ class AutoMonitorAction(BaseAction):
                     lines.append(f"   自动评论：✅ (概率 {int(prob * 100)}%)")
                 return True, "\n".join(lines)
             else:
-                return True, "📡 自动监控状态：未运行\n使用 action=auto_monitor, action_type='start' 启动监控"
+                extra = []
+                if not monitor_enabled:
+                    extra.append("- 监控总开关已关闭：请在 config.toml 将 [monitor].enabled 设为 true")
+                if in_quiet_hours:
+                    extra.append("- 当前处于静默时间窗口，即使启动也会跳过本轮")
+                if cooldown_seconds > 0:
+                    extra.append(f"- 最近有手动触发，冷却剩余约 {cooldown_seconds} 秒")
+
+                base = "📡 自动监控状态：未运行\n使用 action=auto_monitor, action_type='start' 启动监控"
+                if extra:
+                    return True, base + "\n" + "\n".join(extra)
+                return True, base
         except Exception as e:
             logger.error(f"[AutoMonitor] 获取状态异常: {e}")
             return False, f"获取监控状态失败: {e}"
@@ -173,9 +197,9 @@ class AutoMonitorAction(BaseAction):
             result = await service.start_monitor(config)
 
             if result.get("success"):
+                status = await service.get_monitor_status()
                 lines = ["✅ 自动监控已启动"]
-                if config.get("interval"):
-                    lines.append(f"   监控间隔：{config['interval']} 秒")
+                lines.append(f"   监控间隔：{int(status.get('interval', 300) or 300)} 秒")
                 if config.get("target_group"):
                     lines.append(f"   推送群：{config['target_group']}")
                 if config.get("target_user"):
@@ -186,6 +210,8 @@ class AutoMonitorAction(BaseAction):
                 if config.get("auto_comment"):
                     prob = config.get("comment_probability", 0.3)
                     lines.append(f"   自动评论：✅ (概率 {int(prob * 100)}%)")
+                if not bool(status.get("baseline_initialized", False)):
+                    lines.append("   首轮说明：首次轮询会先建立基线，不会补推历史动态")
                 logger.info("[AutoMonitor] 启动成功")
                 return True, "\n".join(lines)
             else:

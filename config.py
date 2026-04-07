@@ -43,7 +43,7 @@ class QzoneConfig(BaseConfig):
 
         enabled: bool = Field(default=True, description="监控总开关，关闭后不允许启动自动监控")
         # 范围: 60 ~ 86400 秒
-        default_interval: int = Field(default=5400, description="默认监控间隔（秒），范围 60-86400")
+        default_interval: int = Field(default=1800, description="默认监控间隔（秒），范围 60-86400")
         # 概率配置（0=不执行，1=必定执行）
         like_probability: float = Field(
             default=0.8,
