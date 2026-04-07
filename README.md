@@ -248,7 +248,7 @@ qzone_shuoshuo/
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `enabled` | `true` | 监控总开关，关闭后不允许启动自动监控 |
-| `default_interval` | `300` | 默认监控间隔（秒），当未传 `interval` 时生效，范围 60-86400 |
+| `default_interval` | `1800` | 默认监控间隔（秒），当未传 `interval` 时生效，范围 60-86400 |
 | `like_probability` | `0.8` | 点赞概率 (0.0-1.0)，0.8=80% |
 | `comment_probability` | `0.3` | 评论概率 (0.0-1.0)，0.3=30% |
 | `enable_auto_reply_comments` | `true` | 是否自动回复自己说说下的评论 |
