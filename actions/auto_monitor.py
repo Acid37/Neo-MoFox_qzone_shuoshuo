@@ -34,10 +34,10 @@ class AutoMonitorAction(BaseAction):
         "- interval: 监控间隔秒数（可选），仅 start 时有效；未传则使用配置 monitor.default_interval\n"
         "- target_group: 通知推送群号（可选）\n"
         "- target_user: 通知推送QQ号（可选）\n"
-        "- auto_comment: 是否自动评论（可选），true/false\n"
-        "- auto_like: 是否自动点赞（可选），true/false\n"
-        "- like_probability: 点赞概率（可选），0.0-1.0，默认 1.0\n"
-        "- comment_probability: 评论概率（可选），0.0-1.0，默认 0.3\n"
+        "- auto_comment: 是否自动评论（可选），未传则使用 monitor.auto_comment\n"
+        "- auto_like: 是否自动点赞（可选），未传则使用 monitor.auto_like\n"
+        "- like_probability: 点赞概率（可选），0.0-1.0，未传则使用 monitor.like_probability\n"
+        "- comment_probability: 评论概率（可选），0.0-1.0，未传则使用 monitor.comment_probability\n"
         "使用示例：\n"
         "1. 启动监控：action=auto_monitor, action_type='start'\n"
         "2. 启动并设置间隔：action=auto_monitor, action_type='start', interval=600\n"
@@ -241,12 +241,17 @@ class AutoMonitorAction(BaseAction):
                     lines.append(f"   推送群：{config['target_group']}")
                 if config.get("target_user"):
                     lines.append(f"   推送用户：{config['target_user']}")
-                if config.get("auto_like"):
-                    prob = config.get("like_probability", 1.0)
+                if bool(status.get("auto_like", False)):
+                    prob = float(status.get("like_probability", 1.0) or 1.0)
                     lines.append(f"   自动点赞：✅ (概率 {int(prob * 100)}%)")
-                if config.get("auto_comment"):
-                    prob = config.get("comment_probability", 0.3)
+                else:
+                    lines.append("   自动点赞：❌")
+
+                if bool(status.get("auto_comment", False)):
+                    prob = float(status.get("comment_probability", 0.3) or 0.3)
                     lines.append(f"   自动评论：✅ (概率 {int(prob * 100)}%)")
+                else:
+                    lines.append("   自动评论：❌")
                 if not bool(status.get("baseline_initialized", False)):
                     lines.append("   首轮说明：首次轮询会先建立基线，不会补推历史动态")
                 logger.info("[AutoMonitor] 启动成功")

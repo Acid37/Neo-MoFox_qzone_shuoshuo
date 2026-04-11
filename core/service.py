@@ -63,7 +63,7 @@ class QzoneService(BaseService):
 
     service_name = "qzone"
     service_description = "QQ空间说说核心服务"
-    version = "1.1.0"
+    version = "1.2.5"
 
     EMOTION_PUBLISH_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6"
     UPLOAD_URL = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image"
@@ -120,6 +120,7 @@ class QzoneService(BaseService):
         # 监控状态
         self._monitor_running: bool = False
         self._monitor_config: dict[str, Any] = {}
+        self._monitor_cycle_lock: asyncio.Lock = asyncio.Lock()
         # 手动触发后的监控冷却截止时间戳（用于“主动执行后重新计时”）
         self._monitor_cooldown_until: float = 0.0
         # 监控运行态（用于 status 可观测性）
@@ -267,6 +268,52 @@ class QzoneService(BaseService):
 
         return "最近已发布内容（请避免语义重复）：\n" + "\n".join(lines)
 
+    async def generate_random_publish_topic(self) -> str | None:
+        """生成随机发布主题（LLM驱动）。
+
+        说明：
+        - 仅生成“主题/灵感”，不直接生成说说正文。
+        - 输出应简短且多样，供后续发布改写链路继续扩写。
+        """
+        persona_text, style_text = self._get_persona_and_style_for_prompt()
+        history_block = self._build_publish_history_block(limit=8)
+        history_text = f"\n{history_block}\n" if history_block else ""
+
+        system_prompt = (
+            "你是中文社交媒体选题助手。"
+            "你的任务是给出一个简短且有启发性的发帖主题。"
+            "只输出主题本身，不要解释。"
+        )
+        user_prompt = (
+            "请随机生成一个适合 QQ 空间的发布主题，要求：\n"
+            "- 仅输出主题本身（一个短语或短句）\n"
+            "- 长度 6~18 字\n"
+            "- 贴近日常生活，可激发具体表达\n"
+            "- 与最近主题语义避免重复\n"
+            "- 不要包含引号、编号、前后缀说明\n\n"
+            f"人设参考：{persona_text}\n"
+            f"表达风格：{style_text}\n"
+            f"{history_text}"
+        )
+
+        try:
+            topic = await self._generate_ai_comment_from_full_prompt(user_prompt, system_prompt)
+        except Exception as e:
+            self._log("warning", "[随机主题]", f"LLM生成失败: {e}")
+            return None
+
+        cleaned = str(topic or "").strip().replace("\n", " ").replace("\r", " ")
+        cleaned = cleaned.strip('"\'“”`')
+        cleaned = " ".join(cleaned.split())
+
+        if len(cleaned) < 2:
+            return None
+
+        if len(cleaned) > 24:
+            cleaned = cleaned[:24].strip()
+
+        return cleaned or None
+
     def _trim_read_tids(self, keep_max: int = 2000) -> None:
         """限制已读追踪规模，避免状态无限增长。"""
         if len(self._read_tids) <= keep_max:
@@ -316,6 +363,46 @@ class QzoneService(BaseService):
                 continue
             unread.append(item)
         return unread
+
+    def _count_unread_candidates(self, items: list[dict[str, Any]]) -> int:
+        """统计列表中的未读候选数量（排除已读与处理中）。"""
+        count = 0
+        for item in items:
+            tid = str(item.get("tid", "") or "").strip()
+            if not tid:
+                continue
+            if tid in self._read_tids:
+                continue
+            if tid in self._processing_read_tids:
+                continue
+            count += 1
+        return count
+
+    def _count_interactable_candidates(self, items: list[dict[str, Any]], *, current_qq: str | None) -> int:
+        """统计可互动候选数量（未读且排除本人与已评论）。"""
+        count = 0
+        resolved_current_qq = str(current_qq or "").strip() or None
+
+        for item in items:
+            tid = str(item.get("tid", "") or "").strip()
+            if not tid:
+                continue
+
+            if tid in self._read_tids:
+                continue
+            if tid in self._processing_read_tids:
+                continue
+
+            owner_qq = str(item.get("uin", "") or "").strip() or None
+            if resolved_current_qq and owner_qq and owner_qq == resolved_current_qq:
+                continue
+
+            if self._is_commented(tid):
+                continue
+
+            count += 1
+
+        return count
 
     def claim_unread_shuoshuo(self, items: list[dict[str, Any]], limit: int | None = None) -> list[dict[str, Any]]:
         """领取未读说说用于处理（并发防重）。
@@ -849,7 +936,8 @@ class QzoneService(BaseService):
             data = orjson.loads(text)
             if data.get("code") == 0:
                 msglist = data.get("msglist") or []
-                logger.info(f"[获取列表] 成功, 获取到 {len(msglist)} 条说说")
+                unread_candidates = self._count_unread_candidates(msglist)
+                logger.info(f"[获取列表] 成功, 本次检索到未读说说 {unread_candidates} 条")
                 return Result.ok(msglist)
             elif data.get("code") == -3000:
                 logger.warning("[获取列表] Cookie 已失效，尝试刷新...")
@@ -885,7 +973,8 @@ class QzoneService(BaseService):
             data = orjson.loads(text)
             if data.get("code") == 0:
                 msglist = data.get("msglist") or []
-                logger.info(f"[重试获取列表] 成功, 获取到 {len(msglist)} 条说说")
+                unread_candidates = self._count_unread_candidates(msglist)
+                logger.info(f"[重试获取列表] 成功, 本次检索到未读说说 {unread_candidates} 条")
                 return Result.ok(msglist)
             elif data.get("code") == -3000:
                 logger.error("[重试获取列表] 刷新后的 Cookie 仍然失效")
@@ -1470,12 +1559,11 @@ class QzoneService(BaseService):
 
         # 检查是否启用回复自己说说的评论
         monitor_cfg = getattr(self.config, "monitor", None)
-        enable_reply_comments = getattr(monitor_cfg, "enable_auto_reply_comments", True)
-        auto_comment_enabled = bool(self._monitor_config.get("auto_comment", False))
-        if enable_reply_comments and auto_comment_enabled:
+        enable_reply_comments = bool(getattr(monitor_cfg, "enable_auto_reply_comments", True))
+        if enable_reply_comments:
             await self._check_and_reply_own_feed_comments(current_qq)
-        elif enable_reply_comments and not auto_comment_enabled:
-            logger.debug("[评论回复] auto_comment 未开启，自动回复评论随互动开关一并关闭")
+        else:
+            logger.debug("[评论回复] 已关闭自动回复评论（monitor.enable_auto_reply_comments=false）")
 
         logger.debug(f"[说说监控] 检查 QQ={current_qq} 的说说")
         result = await self.get_shuoshuo_list(current_qq, count=5)
@@ -1487,6 +1575,15 @@ class QzoneService(BaseService):
         if not latest_list:
             logger.debug("[说说监控] 说说列表为空")
             return "skip_empty_list"
+
+        unread_candidates = self._count_unread_candidates(latest_list)
+        interactable_candidates = self._count_interactable_candidates(
+            latest_list,
+            current_qq=current_qq,
+        )
+        logger.info(
+            f"[说说监控] 本次检索到未读说说 {unread_candidates} 条，可互动 {interactable_candidates} 条（排除本人/已评论）"
+        )
 
         latest_item = latest_list[0]
         latest_tid = latest_item.get("tid")
@@ -1763,6 +1860,13 @@ class QzoneService(BaseService):
     ) -> str:
         """构建回复评论的上下文输入提示词（行为规则由系统提示词主导）。"""
         persona_text, style_text = self._get_persona_and_style_for_prompt()
+        identity_text, safety_guidelines, negative_behaviors = self._get_persona_guardrails_for_prompt()
+
+        safety_block = "\n".join([f"- {item}" for item in safety_guidelines if str(item).strip()])
+        negative_block = "\n".join([f"- {item}" for item in negative_behaviors if str(item).strip()])
+        identity_section = f"\n- 身份：{identity_text}" if identity_text else ""
+        safety_section = f"\n\n# 安全与互动底线\n\n{safety_block}" if safety_block else ""
+        negative_section = f"\n\n# 禁止行为\n\n{negative_block}" if negative_block else ""
 
         relation_hint = f"你与{commenter_name}是 QQ 空间好友关系，互动应保持自然、礼貌、不冒犯。"
         if commenter_qq:
@@ -1782,10 +1886,14 @@ QQ空间是中文社交平台，用户通过“说说”记录日常，好友会
 # 人设定义
 
 {persona_text}
+{identity_section}
 
 # 语言风格
 
 {style_text}
+
+{safety_section}
+{negative_section}
 
 # 当前情景
 
@@ -1906,16 +2014,17 @@ QQ空间是中文社交平台，用户通过“说说”记录日常，好友会
     def _get_personality_for_prompt(self) -> str:
         """从 core.toml 获取人设信息"""
         try:
-            from src.core.config.core_config import core_config
+            from src.core.config import get_core_config
 
-            core_personality = getattr(core_config, "personality_core", "") or ""
-            reply_style = getattr(core_config, "reply_style", "") or ""
+            personality = get_core_config().personality
+            core_personality = str(getattr(personality, "personality_core", "") or "").strip()
+            reply_style = str(getattr(personality, "reply_style", "") or "").strip()
 
             personality_parts = []
             if core_personality:
-                personality_parts.append(f"# 你的核心人设\n{core_personality.strip()}")
+                personality_parts.append(f"# 你的核心人设\n{core_personality}")
             if reply_style:
-                personality_parts.append(f"# 你的表达风格\n{reply_style.strip()}")
+                personality_parts.append(f"# 你的表达风格\n{reply_style}")
 
             return "\n\n".join(personality_parts) if personality_parts else ""
         except Exception:
@@ -1927,11 +2036,12 @@ QQ空间是中文社交平台，用户通过“说说”记录日常，好友会
         style_text = "口语化、简洁、有温度，像真实好友在聊天。"
 
         try:
-            from src.core.config.core_config import core_config
+            from src.core.config import get_core_config
 
-            personality_core = str(getattr(core_config, "personality_core", "") or "").strip()
-            personality_side = str(getattr(core_config, "personality_side", "") or "").strip()
-            reply_style = str(getattr(core_config, "reply_style", "") or "").strip()
+            personality = get_core_config().personality
+            personality_core = str(getattr(personality, "personality_core", "") or "").strip()
+            personality_side = str(getattr(personality, "personality_side", "") or "").strip()
+            reply_style = str(getattr(personality, "reply_style", "") or "").strip()
 
             if personality_core and personality_side:
                 persona_text = f"{personality_core}，{personality_side}"
@@ -1946,6 +2056,96 @@ QQ空间是中文社交平台，用户通过“说说”记录日常，好友会
             pass
 
         return persona_text, style_text
+
+    def _compact_prompt_rules(
+        self,
+        rules: list[str],
+        *,
+        max_items: int = 6,
+        max_chars: int = 60,
+        priority_keywords: list[str] | None = None,
+    ) -> list[str]:
+        """精简提示词规则列表（去重、限长度、按优先级裁剪、限条数）。"""
+        compacted_all: list[tuple[int, str, str]] = []
+        seen: set[str] = set()
+
+        normalized_max_items = max(1, int(max_items))
+        normalized_max_chars = max(8, int(max_chars))
+        normalized_keywords = [str(item).strip().lower() for item in list(priority_keywords or []) if str(item).strip()]
+
+        for index, raw in enumerate(list(rules or [])):
+            text = str(raw or "").strip()
+            if not text:
+                continue
+
+            normalized = " ".join(text.split()).lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+
+            compacted_text = text
+            if len(compacted_text) > normalized_max_chars:
+                compacted_text = compacted_text[: normalized_max_chars - 1].rstrip() + "…"
+
+            compacted_all.append((index, compacted_text, normalized))
+
+        if normalized_keywords:
+            def _rule_score(normalized_rule: str) -> int:
+                score = 0
+                for keyword in normalized_keywords:
+                    if keyword in normalized_rule:
+                        score += 1
+                return score
+
+            compacted_all.sort(key=lambda item: (-_rule_score(item[2]), item[0]))
+
+        compacted = [item[1] for item in compacted_all[:normalized_max_items]]
+
+        return compacted
+
+    def _get_persona_guardrails_for_prompt(self) -> tuple[str, list[str], list[str]]:
+        """获取轻量人格补充信息（身份/安全底线/禁止行为）。"""
+        identity_text = ""
+        safety_guidelines: list[str] = []
+        negative_behaviors: list[str] = []
+
+        try:
+            from src.core.config import get_core_config
+
+            personality = get_core_config().personality
+            identity_text = str(getattr(personality, "identity", "") or "").strip()
+            raw_safety = [str(item).strip() for item in list(getattr(personality, "safety_guidelines", []) or []) if str(item).strip()]
+            raw_negative = [str(item).strip() for item in list(getattr(personality, "negative_behaviors", []) or []) if str(item).strip()]
+
+            safety_priority_keywords = ["危险", "违法", "暴力", "色情", "隐私", "诈骗", "骚扰", "敏感", "攻击"]
+            negative_priority_keywords = ["禁止", "不得", "不能", "不", "隐私", "攻击", "诈骗", "违法", "冒犯", "威胁"]
+
+            safety_guidelines = self._compact_prompt_rules(
+                raw_safety,
+                max_items=6,
+                max_chars=60,
+                priority_keywords=safety_priority_keywords,
+            )
+            negative_behaviors = self._compact_prompt_rules(
+                raw_negative,
+                max_items=6,
+                max_chars=60,
+                priority_keywords=negative_priority_keywords,
+            )
+
+            if self._is_debug():
+                self._log(
+                    "debug",
+                    "[提示词精简]",
+                    (
+                        f"safety {len(raw_safety)} -> {len(safety_guidelines)}, "
+                        f"negative {len(raw_negative)} -> {len(negative_behaviors)}"
+                    ),
+                )
+        except Exception:
+            pass
+
+        return identity_text, safety_guidelines, negative_behaviors
 
     async def _notify_new_shuoshuo(self, item: dict) -> None:
         """发送新说说通知"""
@@ -2140,6 +2340,12 @@ QQ空间是中文社交平台，用户通过“说说”记录日常，好友会
         forbidden = self.DEFAULT_COMMENT_FORBIDDEN
 
         persona_text, style_text = self._get_persona_and_style_for_prompt()
+        identity_text, safety_guidelines, negative_behaviors = self._get_persona_guardrails_for_prompt()
+        safety_block = "\n".join([f"- {item}" for item in safety_guidelines if str(item).strip()])
+        negative_block = "\n".join([f"- {item}" for item in negative_behaviors if str(item).strip()])
+        identity_section = f"\n- 身份：{identity_text}" if identity_text else ""
+        safety_section = f"\n\n# 安全与互动底线\n\n{safety_block}" if safety_block else ""
+        negative_section = f"\n\n# 禁止行为\n\n{negative_block}" if negative_block else ""
         relation_hint = f"你与{nickname}是 QQ 空间好友关系，互动应保持自然、友善、不冒犯。"
 
         # 获取当前时间
@@ -2152,10 +2358,14 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
 # 人设定义
 
 {persona_text}
+{identity_section}
 
 # 语言风格
 
 {style_text}
+
+{safety_section}
+{negative_section}
 
 # 当前情景
 
@@ -2329,6 +2539,8 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
         monitor_enabled = bool(getattr(monitor_cfg, "enabled", True)) if monitor_cfg else True
         default_interval = int(getattr(monitor_cfg, "default_interval", 300)) if monitor_cfg else 300
         default_interval = max(60, min(default_interval, 86400))
+        default_auto_like = bool(getattr(monitor_cfg, "auto_like", True)) if monitor_cfg else True
+        default_auto_comment = bool(getattr(monitor_cfg, "auto_comment", True)) if monitor_cfg else True
         like_prob = self._monitor_config.get("like_probability")
         if like_prob is None and monitor_cfg:
             like_prob = getattr(monitor_cfg, "like_probability", 1.0)
@@ -2360,8 +2572,8 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
             "interval": self._monitor_config.get("interval", default_interval),
             "target_group": self._monitor_config.get("target_group", ""),
             "target_user": self._monitor_config.get("target_user", ""),
-            "auto_comment": self._monitor_config.get("auto_comment", False),
-            "auto_like": self._monitor_config.get("auto_like", False),
+            "auto_comment": bool(self._monitor_config.get("auto_comment", default_auto_comment)),
+            "auto_like": bool(self._monitor_config.get("auto_like", default_auto_like)),
             "like_probability": like_prob or 1.0,
             "comment_probability": comment_prob or 0.3,
             "quiet_hours_enabled": quiet_enabled,
@@ -2507,6 +2719,9 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
             self._last_monitor_result = str(getattr(self, "_last_monitor_result", "never") or "never")
             self._last_monitor_error = str(getattr(self, "_last_monitor_error", "") or "")
             self._last_monitor_skip_reason = str(getattr(self, "_last_monitor_skip_reason", "") or "")
+            existing_monitor_lock = getattr(self, "_monitor_cycle_lock", None)
+            if not isinstance(existing_monitor_lock, asyncio.Lock):
+                self._monitor_cycle_lock = asyncio.Lock()
 
             if not self._is_monitor_enabled():
                 logger.warning("[自动监控] 启动被拒绝：监控总开关已关闭")
@@ -2521,9 +2736,21 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
             # 获取间隔
             monitor_cfg = getattr(self.config, "monitor", None)
             default_interval = int(getattr(monitor_cfg, "default_interval", 300)) if monitor_cfg else 300
+            default_auto_like = bool(getattr(monitor_cfg, "auto_like", True)) if monitor_cfg else True
+            default_auto_comment = bool(getattr(monitor_cfg, "auto_comment", True)) if monitor_cfg else True
+            default_like_probability = float(getattr(monitor_cfg, "like_probability", 1.0)) if monitor_cfg else 1.0
+            default_comment_probability = float(getattr(monitor_cfg, "comment_probability", 0.3)) if monitor_cfg else 0.3
+
             interval = config.get("interval", default_interval)
             interval = max(60, min(interval, 86400))  # 限制 60 秒 ~ 24 小时
             self._monitor_config["interval"] = interval
+            self._monitor_config["auto_like"] = bool(config.get("auto_like", default_auto_like))
+            self._monitor_config["auto_comment"] = bool(config.get("auto_comment", default_auto_comment))
+
+            resolved_like_probability = float(config.get("like_probability", default_like_probability))
+            resolved_comment_probability = float(config.get("comment_probability", default_comment_probability))
+            self._monitor_config["like_probability"] = max(0.0, min(1.0, resolved_like_probability))
+            self._monitor_config["comment_probability"] = max(0.0, min(1.0, resolved_comment_probability))
 
             # 启动监控时清空冷却，避免历史手动触发影响新会话
             self._monitor_cooldown_until = 0.0
@@ -2638,43 +2865,63 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
 
     async def _run_auto_monitor(self, *, force: bool = False, source: str = "scheduled") -> str:
         """执行自动监控任务。"""
-        logger.debug(f"[自动监控] 开始检查新说说(force={force}, source={source})")
-        self._last_monitor_run_at = time.time()
-        self._last_monitor_source = source
-        self._last_monitor_force = force
-        self._last_monitor_error = ""
-        self._last_monitor_skip_reason = ""
+        monitor_lock = getattr(self, "_monitor_cycle_lock", None)
+        if not isinstance(monitor_lock, asyncio.Lock):
+            monitor_lock = asyncio.Lock()
+            self._monitor_cycle_lock = monitor_lock
 
-        try:
-            result_code = await self.check_new_shuoshuo(force=force, source=source)
-            normalized = str(result_code or "unknown")
-            if normalized.startswith("skip_"):
-                self._last_monitor_result = "skipped"
-                self._last_monitor_skip_reason = normalized
-            else:
-                self._last_monitor_result = "ok"
+        if monitor_lock.locked():
+            self._last_monitor_run_at = time.time()
+            self._last_monitor_source = source
+            self._last_monitor_force = force
+            self._last_monitor_error = ""
+            self._last_monitor_result = "skipped"
+            self._last_monitor_skip_reason = "skip_busy"
 
             monitor_cfg = getattr(self.config, "monitor", None) if getattr(self, "config", None) else None
             heartbeat_enabled = bool(getattr(monitor_cfg, "log_heartbeat", True)) if monitor_cfg else True
             if heartbeat_enabled:
-                if self._last_monitor_result == "skipped":
-                    human_reason = self._describe_monitor_skip_reason(self._last_monitor_skip_reason)
-                    logger.info(
-                        f"[自动监控][HB] {source} | {'force' if force else 'normal'} | skipped:{human_reason} ({self._last_monitor_skip_reason})"
-                    )
+                logger.info(f"[自动监控][HB] {source} | {'force' if force else 'normal'} | skipped:上一轮监控仍在执行 (skip_busy)")
+            return "skip_busy"
+
+        async with monitor_lock:
+            logger.debug(f"[自动监控] 开始检查新说说(force={force}, source={source})")
+            self._last_monitor_run_at = time.time()
+            self._last_monitor_source = source
+            self._last_monitor_force = force
+            self._last_monitor_error = ""
+            self._last_monitor_skip_reason = ""
+
+            try:
+                result_code = await self.check_new_shuoshuo(force=force, source=source)
+                normalized = str(result_code or "unknown")
+                if normalized.startswith("skip_"):
+                    self._last_monitor_result = "skipped"
+                    self._last_monitor_skip_reason = normalized
                 else:
-                    logger.info(f"[自动监控][HB] {source} | {'force' if force else 'normal'} | ok")
-            return normalized
-        except Exception as e:
-            self._last_monitor_result = "error"
-            self._last_monitor_error = str(e)
-            logger.error(f"[自动监控] 本轮执行异常(source={source}): {e}")
+                    self._last_monitor_result = "ok"
 
-            monitor_cfg = getattr(self.config, "monitor", None) if getattr(self, "config", None) else None
-            heartbeat_enabled = bool(getattr(monitor_cfg, "log_heartbeat", True)) if monitor_cfg else True
-            if heartbeat_enabled:
-                logger.info(f"[自动监控][HB] {source} | {'force' if force else 'normal'} | error")
-            return "error"
+                monitor_cfg = getattr(self.config, "monitor", None) if getattr(self, "config", None) else None
+                heartbeat_enabled = bool(getattr(monitor_cfg, "log_heartbeat", True)) if monitor_cfg else True
+                if heartbeat_enabled:
+                    if self._last_monitor_result == "skipped":
+                        human_reason = self._describe_monitor_skip_reason(self._last_monitor_skip_reason)
+                        logger.info(
+                            f"[自动监控][HB] {source} | {'force' if force else 'normal'} | skipped:{human_reason} ({self._last_monitor_skip_reason})"
+                        )
+                    else:
+                        logger.info(f"[自动监控][HB] {source} | {'force' if force else 'normal'} | ok")
+                return normalized
+            except Exception as e:
+                self._last_monitor_result = "error"
+                self._last_monitor_error = str(e)
+                logger.error(f"[自动监控] 本轮执行异常(source={source}): {e}")
+
+                monitor_cfg = getattr(self.config, "monitor", None) if getattr(self, "config", None) else None
+                heartbeat_enabled = bool(getattr(monitor_cfg, "log_heartbeat", True)) if monitor_cfg else True
+                if heartbeat_enabled:
+                    logger.info(f"[自动监控][HB] {source} | {'force' if force else 'normal'} | error")
+                return "error"
 
     def _describe_monitor_skip_reason(self, reason_code: str) -> str:
         """将监控跳过原因码转换为可读中文描述。"""
@@ -2699,6 +2946,7 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
         mapping = {
             "skip_disabled": "监控总开关关闭",
             "skip_not_running": "监控未运行",
+            "skip_busy": "上一轮监控仍在执行",
             "skip_no_qq": "未获取到登录QQ",
             "skip_list_failed": "读取说说列表失败",
             "skip_empty_list": "说说列表为空",

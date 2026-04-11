@@ -49,6 +49,14 @@ class QzoneConfig(BaseConfig):
             default=True,
             description="是否输出每轮监控心跳日志（info级），用于确认监控仍在运行"
         )
+        auto_like: bool = Field(
+            default=True,
+            description="是否默认启用自动点赞（start 未显式传参时生效）"
+        )
+        auto_comment: bool = Field(
+            default=True,
+            description="是否默认启用自动评论（start 未显式传参时生效）"
+        )
         # 概率配置（0=不执行，1=必定执行）
         like_probability: float = Field(
             default=0.8,

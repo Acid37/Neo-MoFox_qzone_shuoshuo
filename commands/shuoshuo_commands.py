@@ -29,15 +29,6 @@ class SendFeedCommand(BaseCommand):
     command_name = "send_feed"
     command_prefix = "/"
 
-    _RANDOM_SEEDS: tuple[str, ...] = (
-        "今天的一个小确幸",
-        "最近在想的一件小事",
-        "今天的天气和心情",
-        "一个想记录下来的瞬间",
-        "今天想和朋友分享的感受",
-        "最近生活里的微小进展",
-        "此刻的一点灵感",
-    )
     _RANDOM_KEYWORDS: tuple[str, ...] = ("随机", "random", "rand")
     _IDEMPOTENT_WINDOW_SECONDS: float = 2.5
 
@@ -79,17 +70,32 @@ class SendFeedCommand(BaseCommand):
         cache[key] = now
         return False
 
-    def _build_random_seed(self) -> str:
-        """构造随机发布灵感。"""
-        return random.choice(self._RANDOM_SEEDS)
-
     async def execute(self, message_text: str) -> tuple[bool, str]:
+        from src.app.plugin_system.api.service_api import get_service
+        from src.core.components.base import BaseService
+
+        service = get_service("qzone_shuoshuo:service:qzone")
+        if not service or not isinstance(service, BaseService):
+            return False, "服务未启动"
+
         raw_topic = message_text.strip()
         topic = raw_topic
         used_random_seed = False
         normalized = topic.lower()
+
         if (not topic) or (normalized in self._RANDOM_KEYWORDS):
-            topic = self._build_random_seed()
+            generated_topic = ""
+            topic_generator = getattr(service, "generate_random_publish_topic", None)
+            if callable(topic_generator):
+                try:
+                    maybe_topic = topic_generator()
+                    if inspect.isawaitable(maybe_topic):
+                        maybe_topic = await maybe_topic
+                    generated_topic = str(maybe_topic or "").strip()
+                except Exception as e:
+                    logger.warning(f"[send_feed] 生成随机主题失败，将使用默认短主题: {e}")
+
+            topic = generated_topic or "记录一下今天的一点小感受"
             used_random_seed = True
 
         idem_key = self._build_idempotent_key(
@@ -109,13 +115,6 @@ class SendFeedCommand(BaseCommand):
             )
         except Exception as e:
             logger.debug(f"[send_feed] 预提示发送失败（已忽略）: {e}")
-
-        from src.app.plugin_system.api.service_api import get_service
-        from src.core.components.base import BaseService
-
-        service = get_service("qzone_shuoshuo:service:qzone")
-        if not service or not isinstance(service, BaseService):
-            return False, "服务未启动"
 
         result = await service.publish_shuoshuo(content=topic)
         if result.is_success:

@@ -28,9 +28,9 @@ class QzoneCommandHandler(BaseEventHandler):
     """拦截并执行 qzone 命令。"""
 
     handler_name = "qzone_command_handler"
-    handler_description = "执行 /send_feed 与 /read_feed 命令，并放行后续消息流程。"
+    handler_description = "执行 /send_feed 与 /read_feed 命令，并在命中时拦截后续对话流程。"
     weight = 200
-    intercept_message = False
+    intercept_message = True
     init_subscribe = [EventType.ON_MESSAGE_RECEIVED]
 
     _SUPPORTED_COMMANDS = {"send_feed", "read_feed"}
@@ -78,7 +78,7 @@ class QzoneCommandHandler(BaseEventHandler):
                 stream_id=message.stream_id,
                 platform=message.platform,
             )
-            return EventDecision.PASS, params
+            return EventDecision.STOP, params
 
         signature = str(getattr(command_cls, "_signature_", "") or "")
         if not signature.startswith("qzone_shuoshuo:command:"):
@@ -96,7 +96,7 @@ class QzoneCommandHandler(BaseEventHandler):
                 stream_id=message.stream_id,
                 platform=message.platform,
             )
-            return EventDecision.PASS, params
+            return EventDecision.STOP, params
         except Exception as exc:
             logger.error(f"[命令处理] 执行失败: {exc}")
             await self._delay_response_with_jitter()
@@ -105,4 +105,4 @@ class QzoneCommandHandler(BaseEventHandler):
                 stream_id=message.stream_id,
                 platform=message.platform,
             )
-            return EventDecision.PASS, params
+            return EventDecision.STOP, params
