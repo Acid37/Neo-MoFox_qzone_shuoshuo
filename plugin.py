@@ -21,7 +21,6 @@ from .actions import (
 )
 from .commands import SendFeedCommand, ReadFeedCommand
 from .event_handlers import QzoneCommandHandler
-from .core.dependency_manager import DependencyManager
 
 logger = get_logger("qzone_shuoshuo")
 
@@ -31,14 +30,13 @@ class QzoneShuoshuoPlugin(BasePlugin):
     """QQ空间说说插件主类"""
 
     plugin_name = "qzone_shuoshuo"
-    plugin_version = "1.2.8"
+    plugin_version = "1.4.0"
     plugin_author = "可可和满月月喵"
-    plugin_description = "QQ空间说说发送插件，支持发布、查询说说内容"
+    plugin_description = "QQ空间说说智能插件，支持AI驱动的发布、互动与自动监控"
     configs = [QzoneConfig]
 
     def __init__(self, config=None) -> None:
         super().__init__(config)
-        self._dependency_manager = DependencyManager()
         self._auto_start_retry_task_id: str | None = None
 
     def _is_monitor_auto_start_enabled(self) -> bool:
@@ -127,15 +125,7 @@ class QzoneShuoshuoPlugin(BasePlugin):
             self._auto_start_retry_task_id = None
 
     async def on_plugin_loaded(self) -> None:
-        """插件加载钩子：内置依赖检查与自动安装（开箱即用）。"""
-        ok = await self._dependency_manager.ensure_dependencies(
-            auto_install=True,
-            installer="auto",
-            timeout_seconds=180,
-        )
-        if not ok:
-            logger.warning("QzoneShuoshuo 依赖检查未完全通过，相关功能可能不可用")
-
+        """插件加载钩子：框架已自动处理依赖安装。"""
         auto_started = await self._try_auto_start_monitor()
         if not auto_started:
             self._schedule_auto_start_retry_task()

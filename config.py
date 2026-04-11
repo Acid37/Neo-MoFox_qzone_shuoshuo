@@ -43,6 +43,14 @@ class QzoneConfig(BaseConfig):
 
         enabled: bool = Field(default=True, description="监控总开关，关闭后不允许启动自动监控")
         auto_start: bool = Field(default=True, description="插件加载后是否自动启动监控")
+        feed_source: str = Field(
+            default="friend_flow",
+            description="监控动态源: friend_flow(好友动态流)/self_list(自己空间列表)"
+        )
+        friend_feed_count: int = Field(
+            default=20,
+            description="friend_flow 源每轮抓取条数（5-50）"
+        )
         # 范围: 60 ~ 86400 秒
         default_interval: int = Field(default=1800, description="默认监控间隔（秒），范围 60-86400")
         log_heartbeat: bool = Field(

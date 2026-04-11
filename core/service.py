@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html as html_lib
 import json
 import re
 import random
@@ -20,6 +21,15 @@ from typing import Any, Tuple, TypeVar, Generic, TYPE_CHECKING
 
 import httpx
 import orjson
+
+try:
+    import bs4
+    from bs4 import BeautifulSoup, Tag
+    HAS_BS4 = True
+except ImportError:
+    HAS_BS4 = False
+    BeautifulSoup = None
+    Tag = None
 
 from src.core.components.base import BaseService
 from src.app.plugin_system.api.log_api import get_logger
@@ -64,12 +74,13 @@ class QzoneService(BaseService):
 
     service_name = "qzone"
     service_description = "QQ空间说说核心服务"
-    version = "1.2.8"
+    version = "1.4.0"
 
     EMOTION_PUBLISH_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6"
     UPLOAD_URL = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image"
     COMMENT_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
     LIST_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6"
+    ZONE_LIST_URL = "https://user.qzone.qq.com/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds3_html_more"
     ADAPTER_SIGNATURE = "napcat_adapter:adapter:napcat_adapter"
 
     DEFAULT_COMMENT_SYSTEM_PROMPT = (
@@ -113,17 +124,21 @@ class QzoneService(BaseService):
         self.config: QzoneConfig = getattr(plugin, "config", None)  # type: ignore
         from ..core.cookie_manager import CookieManager
         self.cookie_manager = CookieManager(self._data_dir())
+
+        # ==================== 说说追踪 ====================
         self._last_tid: str | None = None
-        # 评论追踪：记录已评论的说说ID及其时间
-        self._commented_tids: dict[str, float] = {}
-        # 评论回复追踪：记录已回复的评论 (fid + comment_id)
-        self._replied_comments: set[str] = set()
-        # 监控状态
+        self._commented_tids: dict[str, float] = {}  # 已评论的说说ID及时间
+        self._replied_comments: set[str] = set()     # 已回复的评论 (fid + comment_id)
+        self._read_tids: dict[str, float] = {}       # 已读说说追踪
+        self._processing_read_tids: set[str] = set() # 正在处理中的说说（并发防重）
+        self._processing_comments: set[str] = set()  # 正在处理中的评论（并发防重）
+
+        # ==================== 监控状态 ====================
         self._monitor_running: bool = False
         self._monitor_config: dict[str, Any] = {}
         self._monitor_cycle_lock: asyncio.Lock = asyncio.Lock()
-        # 手动触发后的监控冷却截止时间戳（用于“主动执行后重新计时”）
-        self._monitor_cooldown_until: float = 0.0
+        self._monitor_cooldown_until: float = 0.0  # 手动触发后的冷却截止时间
+
         # 监控运行态（用于 status 可观测性）
         self._last_monitor_run_at: float = 0.0
         self._last_monitor_source: str = ""
@@ -131,28 +146,28 @@ class QzoneService(BaseService):
         self._last_monitor_result: str = "never"
         self._last_monitor_error: str = ""
         self._last_monitor_skip_reason: str = ""
-        # 启动连接就绪重试（首轮拿不到 QQ 时触发）
+
+        # ==================== 启动重试 ====================
         self._startup_retry_active: bool = False
         self._startup_retry_attempt: int = 0
         self._startup_retry_max_attempts: int = 0
         self._startup_retry_interval: int = 0
         self._startup_retry_job_name: str = ""
         self._startup_retry_last_reason: str = ""
-        # Cookie 误判防护统计（评论空响应二次确认）
+
+        # ==================== Cookie 统计 ====================
         self._cookie_confirm_total: int = 0
         self._cookie_confirm_recovered: int = 0
         self._cookie_confirm_refresh: int = 0
-        # 发布去重（避免模型短时间重复发送同内容）
+
+        # ==================== 发布去重 ====================
         self._last_published_content_hash: str | None = None
         self._last_published_at: float = 0.0
-        # 最近发布文本历史（用于提示词去重与风格多样性）
         self._published_text_history: list[dict[str, Any]] = []
-        # 最近一次阅读摘要（用于跨轮复用，减少重复读取 token）
+
+        # ==================== 阅读摘要 ====================
         self._last_read_snapshot: dict[str, Any] | None = None
-        # 已读说说追踪（用于“只读一次、执行一次”语义）
-        self._read_tids: dict[str, float] = {}
-        # 正在处理中的说说（并发防重）
-        self._processing_read_tids: set[str] = set()
+
         self._load_state()
         logger.info("QzoneService 初始化完成")
 
@@ -365,8 +380,8 @@ class QzoneService(BaseService):
             unread.append(item)
         return unread
 
-    def _count_unread_candidates(self, items: list[dict[str, Any]]) -> int:
-        """统计列表中的未读候选数量（排除已读与处理中）。"""
+    def _count_pending_candidates(self, items: list[dict[str, Any]]) -> int:
+        """统计列表中的候选数量（排除已读与处理中）。"""
         count = 0
         for item in items:
             tid = str(item.get("tid", "") or "").strip()
@@ -378,6 +393,10 @@ class QzoneService(BaseService):
                 continue
             count += 1
         return count
+
+    def _count_unread_candidates(self, items: list[dict[str, Any]]) -> int:
+        """兼容方法：沿用旧命名，语义等同待处理候选。"""
+        return self._count_pending_candidates(items)
 
     def _count_interactable_candidates(self, items: list[dict[str, Any]], *, current_qq: str | None) -> int:
         """统计可互动候选数量（未读且排除本人与已评论）。"""
@@ -937,8 +956,8 @@ class QzoneService(BaseService):
             data = orjson.loads(text)
             if data.get("code") == 0:
                 msglist = data.get("msglist") or []
-                unread_candidates = self._count_unread_candidates(msglist)
-                logger.info(f"[获取列表] 成功, 本次检索到未读说说 {unread_candidates} 条")
+                pending_candidates = self._count_pending_candidates(msglist)
+                logger.info(f"[获取列表] 成功, 本次检索到候选说说 {pending_candidates} 条")
                 return Result.ok(msglist)
             elif data.get("code") == -3000:
                 logger.warning("[获取列表] Cookie 已失效，尝试刷新...")
@@ -953,6 +972,260 @@ class QzoneService(BaseService):
         except Exception as e:
             logger.error(f"[获取列表] 异常: {e}")
             return Result.fail(f"异常: {e}")
+        finally:
+            await client.aclose()
+
+    def _extract_text_from_feed_html(self, html_content: str) -> str:
+        """从好友动态 HTML 片段中提取纯文本内容。
+        
+        使用 bs4.BeautifulSoup 精确解析，优先提取 div.f-info 中的文本。
+        """
+        text = str(html_content or "")
+        if not text:
+            return ""
+
+        # 优先使用 bs4 精确解析
+        if HAS_BS4 and BeautifulSoup:
+            try:
+                soup = BeautifulSoup(text, "html.parser")
+                text_div = soup.find("div", class_="f-info")
+                if isinstance(text_div, Tag):
+                    return text_div.get_text(strip=True)
+                # 如果没有 f-info，返回整个页面的文本
+                return soup.get_text(strip=True)
+            except Exception as e:
+                logger.debug(f"[bs4解析HTML] 失败: {e}，回退到正则方式")
+        
+        # 回退到正则方式
+        text = re.sub(r"<script[\\s\\S]*?</script>", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"<style[\\s\\S]*?</style>", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = html_lib.unescape(text)
+        text = " ".join(text.split())
+        return text.strip()
+
+    def _extract_image_urls_from_feed_html(self, html_content: str) -> list[str]:
+        """从好友动态 HTML 片段中提取图片 URL 列表。
+        
+        使用 bs4.BeautifulSoup 精确提取，包括：
+        - div.img-box 中的图片
+        - div.video-img 中的视频封面
+        排除 qzonestyle.gtimg.cn 静态资源。
+        """
+        text = str(html_content or "")
+        if not text:
+            return []
+
+        urls: list[str] = []
+        
+        # 优先使用 bs4 精确提取
+        if HAS_BS4 and BeautifulSoup:
+            try:
+                soup = BeautifulSoup(text, "html.parser")
+                
+                # 提取 img-box 中的图片
+                img_box = soup.find("div", class_="img-box")
+                if isinstance(img_box, Tag):
+                    for img in img_box.find_all("img"):
+                        if isinstance(img, Tag):
+                            src = img.get("src")
+                            if src and isinstance(src, str) and "qzonestyle.gtimg.cn" not in src:
+                                if src not in urls:
+                                    urls.append(src)
+                
+                # 提取视频封面
+                video_thumb = soup.select_one("div.video-img img")
+                if isinstance(video_thumb, Tag) and "src" in video_thumb.attrs:
+                    src = video_thumb["src"]
+                    if src and isinstance(src, str) and "qzonestyle.gtimg.cn" not in src:
+                        if src not in urls:
+                            urls.append(src)
+                
+                if urls:
+                    return urls
+            except Exception as e:
+                logger.debug(f"[bs4提取图片] 失败: {e}，回退到正则方式")
+        
+        # 回退到正则方式
+        matches = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', text, flags=re.IGNORECASE)
+        for url in matches:
+            cleaned = str(url).strip()
+            if not cleaned:
+                continue
+            if "qzonestyle.gtimg.cn" in cleaned:
+                continue
+            if cleaned in urls:
+                continue
+            urls.append(cleaned)
+        return urls
+
+    async def _get_friend_feed_list(self, count: int = 20) -> "Result[list[dict]]":
+        """获取好友动态流（feeds3_html_more）。"""
+        fetch_count = max(5, min(int(count or 20), 50))
+        login_qq = await self._get_qq_from_napcat()
+        if not login_qq:
+            return Result.fail("无法获取登录 QQ 号")
+
+        client_info = await self._get_client(login_qq)
+        if not client_info:
+            return Result.fail("获取客户端失败")
+
+        client, uin, gtk = client_info
+        params = {
+            "uin": uin,
+            "scope": "0",
+            "view": "1",
+            "filter": "all",
+            "flag": "1",
+            "applist": "all",
+            "pagenum": "1",
+            "count": str(fetch_count),
+            "format": "json",
+            "g_tk": gtk,
+            "useutf8": "1",
+            "outputhtmlfeed": "1",
+        }
+
+        try:
+            resp = await client.get(self.ZONE_LIST_URL, params=params)
+            raw_text = resp.text
+            
+            # 检查是否为 HTML 错误页
+            if raw_text.lower().startswith("<html") or "<title>" in raw_text.lower():
+                logger.error(f"[好友动态] 返回内容为 HTML，疑似接口异常，前200字：{raw_text[:200]}")
+                return Result.fail("接口返回 HTML，疑似被风控/未登录")
+            
+            payload = self._normalize_callback_payload(raw_text)
+            
+            # 检查 payload 是否为空
+            if not payload:
+                logger.warning(f"[好友动态] 接口返回为空，原始响应前200字符: {raw_text[:200]}")
+                return Result.fail("接口返回为空")
+            
+            # 改进的 JSON 解析，处理 QQ 空间非标准格式
+            try:
+                data = orjson.loads(payload)
+            except orjson.JSONDecodeError:
+                # QQ 空间返回的可能是 JavaScript 对象字面量格式，使用 json_repair 修复
+                try:
+                    from json_repair import repair_json
+                    repaired = repair_json(payload)
+                    data = orjson.loads(repaired)
+                    logger.debug("[好友动态] 成功通过 json_repair 修复解析数据")
+                except Exception as fix_err:
+                    logger.error(
+                        f"[好友动态] JSON解析失败且修复也失败: {fix_err}\n"
+                        f"原始响应前500字符: {raw_text[:500]}\n"
+                        f"提取的payload前500字符: {payload[:500]}"
+                    )
+                    return Result.fail(f"好友动态接口返回数据格式异常: {fix_err}")
+
+            code = int(data.get("code", 0) or 0)
+            if code == -3000:
+                return Result.fail("Cookie 失效")
+            if code != 0:
+                return Result.fail(f"获取好友动态失败: {data.get('message') or data.get('msg') or code}")
+
+            feed_rows = ((data.get("data") or {}).get("data") or [])
+            items: list[dict[str, Any]] = []
+
+            for row in feed_rows:
+                if not isinstance(row, dict):
+                    continue
+
+                appid = str(row.get("appid", "") or "").strip()
+                if appid and appid != "311":
+                    continue
+
+                owner_qq = str(row.get("uin", "") or "").strip()
+                if not owner_qq or owner_qq == str(uin):
+                    continue
+
+                tid = str(row.get("key") or row.get("tid") or "").strip()
+                if not tid:
+                    continue
+
+                html_content = str(row.get("html", "") or "")
+                
+                # 使用 bs4 解析 HTML
+                is_liked = False
+                comments = []
+                
+                if HAS_BS4 and BeautifulSoup and html_content:
+                    try:
+                        soup = BeautifulSoup(html_content, "html.parser")
+                        
+                        # 检测点赞状态
+                        like_btn = soup.find("a", class_="qz_like_btn_v3")
+                        if isinstance(like_btn, Tag) and like_btn.get("data-islike") == "1":
+                            is_liked = True
+                        
+                        # 提取评论列表
+                        comment_divs = soup.find_all("div", class_="f-single-comment")
+                        for comment_div in comment_divs:
+                            if not isinstance(comment_div, Tag):
+                                continue
+                            
+                            author_a = comment_div.find("a", class_="f-nick")
+                            content_span = comment_div.find("span", class_="f-re-con")
+                            
+                            if isinstance(author_a, Tag) and isinstance(content_span, Tag):
+                                comment_data = {
+                                    "qq_account": str(comment_div.get("data-uin", "")),
+                                    "nickname": author_a.get_text(strip=True),
+                                    "content": content_span.get_text(strip=True),
+                                    "comment_tid": comment_div.get("data-tid", ""),
+                                    "parent_tid": None,
+                                }
+                                comments.append(comment_data)
+                            
+                            # 提取该评论下的回复
+                            reply_divs = comment_div.find_all("div", class_="f-single-re")
+                            for reply_div in reply_divs:
+                                if not isinstance(reply_div, Tag):
+                                    continue
+                                
+                                reply_author_a = reply_div.find("a", class_="f-nick")
+                                reply_content_span = reply_div.find("span", class_="f-re-con")
+                                
+                                if isinstance(reply_author_a, Tag) and isinstance(reply_content_span, Tag):
+                                    reply_data = {
+                                        "qq_account": str(reply_div.get("data-uin", "")),
+                                        "nickname": reply_author_a.get_text(strip=True),
+                                        "content": reply_content_span.get_text(strip=True),
+                                        "comment_tid": reply_div.get("data-tid", ""),
+                                        "parent_tid": comment_div.get("data-tid", ""),
+                                    }
+                                    comments.append(reply_data)
+                    except Exception as e:
+                        logger.debug(f"[好友动态] bs4解析评论失败: {e}")
+                
+                # 提取文本内容
+                content = self._extract_text_from_feed_html(html_content)
+                if not content:
+                    content = str(row.get("summary") or row.get("title") or "").strip()
+
+                # 提取图片列表
+                image_urls = self._extract_image_urls_from_feed_html(html_content)
+                pic_list = [{"url": url} for url in image_urls]
+
+                items.append(
+                    {
+                        "tid": tid,
+                        "uin": owner_qq,
+                        "content": content,
+                        "pic": pic_list,
+                        "createTime": row.get("abstime", ""),
+                        "is_liked": is_liked,
+                        "comments": comments,
+                    }
+                )
+
+            pending_candidates = self._count_pending_candidates(items)
+            logger.info(f"[好友动态] 获取成功, 原始{len(feed_rows)}条, 候选{pending_candidates}条")
+            return Result.ok(items)
+        except Exception as e:
+            return Result.fail(f"获取好友动态异常: {e}")
         finally:
             await client.aclose()
 
@@ -974,8 +1247,8 @@ class QzoneService(BaseService):
             data = orjson.loads(text)
             if data.get("code") == 0:
                 msglist = data.get("msglist") or []
-                unread_candidates = self._count_unread_candidates(msglist)
-                logger.info(f"[重试获取列表] 成功, 本次检索到未读说说 {unread_candidates} 条")
+                pending_candidates = self._count_pending_candidates(msglist)
+                logger.info(f"[重试获取列表] 成功, 本次检索到候选说说 {pending_candidates} 条")
                 return Result.ok(msglist)
             elif data.get("code") == -3000:
                 logger.error("[重试获取列表] 刷新后的 Cookie 仍然失效")
@@ -1566,10 +1839,21 @@ class QzoneService(BaseService):
         else:
             logger.debug("[评论回复] 已关闭自动回复评论（monitor.enable_auto_reply_comments=false）")
 
-        logger.debug(f"[说说监控] 检查 QQ={current_qq} 的说说")
-        result = await self.get_shuoshuo_list(current_qq, count=5)
+        feed_source = str(getattr(monitor_cfg, "feed_source", "friend_flow") or "friend_flow").strip().lower()
+        if feed_source == "friend_flow":
+            friend_feed_count = int(getattr(monitor_cfg, "friend_feed_count", 20) or 20)
+            friend_feed_count = max(5, min(friend_feed_count, 50))
+            logger.info(
+                f"[说说监控] 监控源=好友动态流(feeds3_html_more), count={friend_feed_count}"
+            )
+            result = await self._get_friend_feed_list(count=friend_feed_count)
+        else:
+            logger.info("[说说监控] 监控源=自己空间列表(msglist_v6)")
+            logger.debug(f"[说说监控] 检查 QQ={current_qq} 的说说")
+            result = await self.get_shuoshuo_list(current_qq, count=5)
+
         if not result.is_success or not result.data:
-            logger.warning("[说说监控] 获取说说列表失败")
+            logger.warning(f"[说说监控] 获取监控源数据失败: {result.error_message}")
             return "skip_list_failed"
 
         latest_list = result.data
@@ -1577,13 +1861,14 @@ class QzoneService(BaseService):
             logger.debug("[说说监控] 说说列表为空")
             return "skip_empty_list"
 
-        unread_candidates = self._count_unread_candidates(latest_list)
+        pending_candidates = self._count_pending_candidates(latest_list)
         interactable_candidates = self._count_interactable_candidates(
             latest_list,
             current_qq=current_qq,
         )
+        blocked_candidates = max(pending_candidates - interactable_candidates, 0)
         logger.info(
-            f"[说说监控] 本次检索到未读说说 {unread_candidates} 条，可互动 {interactable_candidates} 条（排除本人/已评论）"
+            f"[说说监控] 本次检索到候选说说 {pending_candidates} 条，可互动 {interactable_candidates} 条，已过滤 {blocked_candidates} 条（本人/已评论）"
         )
 
         latest_item = latest_list[0]
@@ -1611,28 +1896,66 @@ class QzoneService(BaseService):
                     "comment_success": 0,
                     "comment_failed": 0,
                 }
-                logger.info(f"[说说监控] 检测到 {len(new_items)} 条新说说")
+                
+                # 单轮处理上限，避免密集 API 调用触发风控
+                MAX_PROCESS_PER_CYCLE = 5
+                processed_count = 0
+                skipped_already_liked = 0
+                
+                logger.info(f"[说说监控] 检测到 {len(new_items)} 条新说说，单轮最多处理 {MAX_PROCESS_PER_CYCLE} 条")
+                
                 for item in reversed(new_items):
+                    # 检查是否已达单轮上限
+                    if processed_count >= MAX_PROCESS_PER_CYCLE:
+                        remaining = len(new_items) - processed_count
+                        logger.info(
+                            f"[说说监控] 单轮已达上限 ({MAX_PROCESS_PER_CYCLE}条)，"
+                            f"剩余 {remaining} 条将在下轮监控处理"
+                        )
+                        break
+                    
+                    tid = item.get("tid", "")
+                    
+                    # 已点赞过滤：避免重复操作
+                    if item.get("is_liked") and self._monitor_config.get("auto_like"):
+                        self._log("debug", "[批量处理]", f"说说 {tid} 已点赞，跳过互动")
+                        skipped_already_liked += 1
+                        continue
+                    
+                    # 通知推送
                     await self._notify_new_shuoshuo(item)
                     monitor_stats["notified"] += 1
+                    
                     # 自动评论（如果启用）
                     if self._monitor_config.get("auto_comment"):
-                        comment_result = await self._auto_comment_if_enabled(item)
+                        comment_result = await self._auto_comment_if_enabled(item, current_qq=current_qq)
                         if comment_result is True:
                             monitor_stats["comment_success"] += 1
                         elif comment_result is False:
                             monitor_stats["comment_failed"] += 1
+                    
                     # 自动点赞（如果启用）
                     if self._monitor_config.get("auto_like"):
-                        like_result = await self._auto_like_if_enabled(item)
+                        like_result = await self._auto_like_if_enabled(item, current_qq=current_qq)
                         if like_result is True:
                             monitor_stats["like_success"] += 1
                         elif like_result is False:
                             monitor_stats["like_failed"] += 1
+                    
+                    processed_count += 1
+                    
+                    # 批量处理间隔：每条说说间增加 3-8 秒随机延迟
+                    # 仅在还有下一条需要处理时才延迟
+                    if processed_count < MAX_PROCESS_PER_CYCLE and processed_count < len(new_items):
+                        await self._random_human_delay(3.0, 8.0, "[批量处理]")
 
+                if skipped_already_liked > 0:
+                    logger.info(f"[说说监控] 已过滤 {skipped_already_liked} 条已点赞说说")
+                
                 logger.info(
                     "[说说监控] 本轮完成: "
                     f"新动态{monitor_stats['detected']}条, 通知{monitor_stats['notified']}条, "
+                    f"处理{processed_count}条, "
                     f"点赞成功{monitor_stats['like_success']}/失败{monitor_stats['like_failed']}, "
                     f"评论成功{monitor_stats['comment_success']}/失败{monitor_stats['comment_failed']}"
                 )
@@ -1715,16 +2038,30 @@ class QzoneService(BaseService):
             pics = feed.get("pic", [])
             images = [p.get("url", p.get("big_url", "")) for p in pics if isinstance(p, dict)]
 
+            # 提取说说时间，传递给 LLM 用于生成更贴合时间语境的回复
+            story_time = (
+                str(feed.get("createTime2", "") or "").strip()
+                or str(feed.get("create_time", "") or "").strip()
+                or str(feed.get("time", "") or "").strip()
+            )
+
             await self._reply_to_comments(
                 tid=tid,
                 story_content=content or rt_content or "说说内容",
                 comments=comments,
                 images=images,
                 qq_number=qq_number,
+                story_time=story_time,
             )
 
     async def _reply_to_comments(
-        self, tid: str, story_content: str, comments: list, images: list[str], qq_number: str
+        self,
+        tid: str,
+        story_content: str,
+        comments: list,
+        images: list[str],
+        qq_number: str,
+        story_time: str = "",
     ) -> None:
         """回复说说下的评论
 
@@ -1734,6 +2071,7 @@ class QzoneService(BaseService):
             comments: 评论列表
             images: 说说图片 URL 列表
             qq_number: 当前用户 QQ 号
+            story_time: 说说发布时间（用于 LLM 生成回复时的时间上下文）
         """
         if not comments:
             return
@@ -1752,53 +2090,68 @@ class QzoneService(BaseService):
             if self._has_replied_comment(tid, comment_id):
                 continue
 
-            nickname = comment.get("nickname", "网友")
-            comment_content = comment.get("content", "")
-            commenter_qq = str(comment.get("uin", "") or "").strip() or None
-            comment_time = (
-                str(comment.get("createTime2", "") or "").strip()
-                or str(comment.get("create_time", "") or "").strip()
-                or str(comment.get("time", "") or "").strip()
-            )
-            self._log("info", "[评论回复]", f"发现新评论: {nickname}: {comment_content}")
-
-            # 概率控制：与自己说说相关，默认高概率回复
-            monitor_cfg = getattr(self.config, "monitor", None)
-            reply_probability = float(getattr(monitor_cfg, "auto_reply_probability", 0.9)) if monitor_cfg else 0.9
-            reply_probability = max(0.0, min(1.0, reply_probability))
-            if random.random() > reply_probability:
-                self._log("debug", "[评论回复]", f"概率未命中，跳过回复 tid={tid}, comment_id={comment_id}, probability={reply_probability}")
+            # 并发锁：防止同一评论被并发处理时重复回复
+            comment_key = f"{tid}_{comment_id}"
+            if comment_key in self._processing_comments:
+                self._log("debug", "[评论回复]", f"评论 {comment_key} 正在处理中，跳过")
                 continue
 
-            # 生成回复内容
-            reply_text = await self._generate_comment_reply(
-                story_content=story_content,
-                comment_content=comment_content,
-                commenter_name=nickname,
-                commenter_qq=commenter_qq,
-                images=images,
-                story_time="",
-                comment_time=comment_time,
-            )
+            self._log("debug", "[评论回复]", f"锁定待回复评论: {comment_key}")
+            self._processing_comments.add(comment_key)
 
-            if reply_text:
-                # 回复前增加随机延迟，避免连续回复过快
-                await self._random_human_delay(2.0, 6.0, "[评论回复]")
-                # 回复评论（通过评论 API，传入 comment_id 表示回复这条评论）
-                result = await self.comment_shuoshuo(
-                    shuoshuo_id=tid,
-                    content=reply_text,
-                    qq_number=qq_number,
-                    owner_qq=qq_number,
-                    comment_id=comment_id,
+            try:
+                nickname = comment.get("nickname", "网友")
+                comment_content = comment.get("content", "")
+                commenter_qq = str(comment.get("uin", "") or "").strip() or None
+                comment_time = (
+                    str(comment.get("createTime2", "") or "").strip()
+                    or str(comment.get("create_time", "") or "").strip()
+                    or str(comment.get("time", "") or "").strip()
+                )
+                self._log("info", "[评论回复]", f"发现新评论: {nickname}: {comment_content}")
+
+                # 概率控制：与自己说说相关，默认高概率回复
+                monitor_cfg = getattr(self.config, "monitor", None)
+                reply_probability = float(getattr(monitor_cfg, "auto_reply_probability", 0.9)) if monitor_cfg else 0.9
+                reply_probability = max(0.0, min(1.0, reply_probability))
+                if random.random() > reply_probability:
+                    self._log("debug", "[评论回复]", f"概率未命中，跳过回复 tid={tid}, comment_id={comment_id}, probability={reply_probability}")
+                    continue
+
+                # 生成回复内容（传递说说时间和评论时间）
+                reply_text = await self._generate_comment_reply(
+                    story_content=story_content,
+                    comment_content=comment_content,
+                    commenter_name=nickname,
+                    commenter_qq=commenter_qq,
+                    images=images,
+                    story_time=story_time,
+                    comment_time=comment_time,
                 )
 
-                if result.is_success:
-                    self._mark_comment_replied(tid, comment_id)
-                    self._log("info", "[评论回复]", f"回复成功: {reply_text}")
-                else:
-                    category = self._classify_failure_reason(result.error_message)
-                    self._log("warning", "[评论回复]", f"回复失败[{category}]: {result.error_message}")
+                if reply_text:
+                    # 回复前增加随机延迟，避免连续回复过快
+                    await self._random_human_delay(2.0, 6.0, "[评论回复]")
+                    # 回复评论（通过评论 API，传入 comment_id 表示回复这条评论）
+                    result = await self.comment_shuoshuo(
+                        shuoshuo_id=tid,
+                        content=reply_text,
+                        qq_number=qq_number,
+                        owner_qq=qq_number,
+                        comment_id=comment_id,
+                    )
+
+                    if result.is_success:
+                        self._mark_comment_replied(tid, comment_id)
+                        self._log("info", "[评论回复]", f"回复成功: {reply_text}")
+                    else:
+                        category = self._classify_failure_reason(result.error_message)
+                        self._log("warning", "[评论回复]", f"回复失败[{category}]: {result.error_message}")
+            finally:
+                # 无论成功与否，都解除锁定
+                self._log("debug", "[评论回复]", f"解锁评论: {comment_key}")
+                if comment_key in self._processing_comments:
+                    self._processing_comments.remove(comment_key)
 
     async def _generate_comment_reply(
         self,
@@ -2191,7 +2544,7 @@ QQ空间是中文社交平台，用户通过“说说”记录日常，好友会
         except Exception as e:
             logger.error(f"推送新说说通知失败: {e}")
 
-    async def _auto_like_if_enabled(self, item: dict) -> bool | None:
+    async def _auto_like_if_enabled(self, item: dict, *, current_qq: str | None = None) -> bool | None:
         """如果启用自动点赞，则按概率点赞说说
 
         Args:
@@ -2199,6 +2552,12 @@ QQ空间是中文社交平台，用户通过“说说”记录日常，好友会
         """
         tid = item.get("tid")
         if not tid:
+            return None
+
+        owner_qq = str(item.get("uin", "") or "").strip() or None
+        normalized_current_qq = str(current_qq or "").strip() or None
+        if normalized_current_qq and owner_qq and owner_qq == normalized_current_qq:
+            self._log("debug", "[自动点赞]", f"检测到本人动态，跳过点赞 tid={tid}")
             return None
 
         # 获取概率配置
@@ -2226,7 +2585,7 @@ QQ空间是中文社交平台，用户通过“说说”记录日常，好友会
             result = await self.like_shuoshuo(
                 shuoshuo_id=tid,
                 qq_number="",
-                owner_qq=str(item.get("uin", "")) or None,
+                owner_qq=owner_qq,
             )
 
             if result.is_success:
@@ -2239,7 +2598,7 @@ QQ空间是中文社交平台，用户通过“说说”记录日常，好友会
             self._log("error", "[自动点赞]", f"说说 {tid} 点赞异常: {e}")
             return False
 
-    async def _auto_comment_if_enabled(self, item: dict) -> bool | None:
+    async def _auto_comment_if_enabled(self, item: dict, *, current_qq: str | None = None) -> bool | None:
         """如果启用自动评论，则按概率评论说说
 
         Args:
@@ -2253,58 +2612,79 @@ QQ空间是中文社交平台，用户通过“说说”记录日常，好友会
         if not tid:
             return None
 
+        owner_qq = str(item.get("uin", "") or "").strip() or None
+        normalized_current_qq = str(current_qq or "").strip() or None
+        if normalized_current_qq and owner_qq and owner_qq == normalized_current_qq:
+            self._log("debug", "[自动评论]", f"检测到本人动态，跳过评论 tid={tid}")
+            return None
+
         # 检查是否已经评论过
         if self._is_commented(tid):
             self._log("debug", "[自动评论]", f"说说 {tid} 已评论过，跳过")
             return None
 
-        # 获取概率配置
-        # 范围: 0.0 ~ 1.0 (0%=绝不, 100%=必定)
-        monitor_cfg = getattr(self.config, "monitor", None)
-        comment_probability = self._monitor_config.get("comment_probability")
-        if comment_probability is None and monitor_cfg:
-            comment_probability = getattr(monitor_cfg, "comment_probability", 0.3)
-        if comment_probability is None:
-            comment_probability = 0.3
-        # 确保概率在有效范围内
-        comment_probability = max(0.0, min(1.0, comment_probability))
-
-        # 概率判断
-        import random
-        if random.random() > comment_probability:
-            self._log("debug", "[自动评论]", f"概率未命中，跳过评论 tid={tid}, probability={comment_probability}")
+        # 并发锁：防止同一条说说被并发评论
+        comment_key = f"{tid}_auto_comment"
+        if comment_key in self._processing_comments:
+            self._log("debug", "[自动评论]", f"说说 {tid} 正在评论中，跳过")
             return None
 
-        # 获取说说内容用于生成评论
-        content = item.get("content", "")
-        nickname = item.get("nickname", "") or item.get("uin", "")
+        self._log("debug", "[自动评论]", f"锁定待评论说说: {comment_key}")
+        self._processing_comments.add(comment_key)
 
-        # 生成评论内容
-        pics = item.get("pic", [])
-        images = [p.get("url", p.get("big_url", "")) for p in pics if isinstance(p, dict)]
+        try:
+            # 获取概率配置
+            # 范围: 0.0 ~ 1.0 (0%=绝不, 100%=必定)
+            monitor_cfg = getattr(self.config, "monitor", None)
+            comment_probability = self._monitor_config.get("comment_probability")
+            if comment_probability is None and monitor_cfg:
+                comment_probability = getattr(monitor_cfg, "comment_probability", 0.3)
+            if comment_probability is None:
+                comment_probability = 0.3
+            # 确保概率在有效范围内
+            comment_probability = max(0.0, min(1.0, comment_probability))
 
-        comment_text = await self._generate_comment_text(content, nickname, images)
-        if not comment_text:
-            self._log("warning", "[自动评论]", f"说说 {tid} 评论文本生成失败，按策略跳过（无模板兜底）")
-            return None
+            # 概率判断
+            import random
+            if random.random() > comment_probability:
+                self._log("debug", "[自动评论]", f"概率未命中，跳过评论 tid={tid}, probability={comment_probability}")
+                return None
 
-        self._log("info", "[自动评论]", f"开始评论说说 {tid}, 内容: {comment_text}, probability={comment_probability}")
+            # 获取说说内容用于生成评论
+            content = item.get("content", "")
+            nickname = item.get("nickname", "") or item.get("uin", "")
 
-        # 执行评论
-        await self._random_human_delay(1.5, 5.0, "[自动评论]")
-        result = await self.comment_shuoshuo(
-            shuoshuo_id=tid,
-            content=comment_text,
-            qq_number="",
-            owner_qq=str(item.get("uin", "")) or None,
-        )
+            # 生成评论内容
+            pics = item.get("pic", [])
+            images = [p.get("url", p.get("big_url", "")) for p in pics if isinstance(p, dict)]
 
-        if result.is_success:
-            self._log("info", "[自动评论]", f"说说 {tid} 评论成功")
-            return True
-        else:
-            self._log("warning", "[自动评论]", f"说说 {tid} 评论失败: {result.error_message}")
-            return False
+            comment_text = await self._generate_comment_text(content, nickname, images)
+            if not comment_text:
+                self._log("warning", "[自动评论]", f"说说 {tid} 评论文本生成失败，按策略跳过（无模板兜底）")
+                return None
+
+            self._log("info", "[自动评论]", f"开始评论说说 {tid}, 内容: {comment_text}, probability={comment_probability}")
+
+            # 执行评论
+            await self._random_human_delay(1.5, 5.0, "[自动评论]")
+            result = await self.comment_shuoshuo(
+                shuoshuo_id=tid,
+                content=comment_text,
+                qq_number="",
+                owner_qq=owner_qq,
+            )
+
+            if result.is_success:
+                self._log("info", "[自动评论]", f"说说 {tid} 评论成功")
+                return True
+            else:
+                self._log("warning", "[自动评论]", f"说说 {tid} 评论失败: {result.error_message}")
+                return False
+        finally:
+            # 无论成功与否，都解除锁定
+            self._log("debug", "[自动评论]", f"解锁说说: {comment_key}")
+            if comment_key in self._processing_comments:
+                self._processing_comments.remove(comment_key)
 
     async def _generate_comment_text(self, content: str, nickname: str, images: list[str] | None = None) -> str:
         """生成评论文本
