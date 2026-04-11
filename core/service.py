@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import random
 import time
 import datetime
@@ -63,7 +64,7 @@ class QzoneService(BaseService):
 
     service_name = "qzone"
     service_description = "QQ空间说说核心服务"
-    version = "1.2.7"
+    version = "1.2.8"
 
     EMOTION_PUBLISH_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6"
     UPLOAD_URL = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image"
@@ -2421,6 +2422,24 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
             return self.DEFAULT_PUBLISH_SYSTEM_PROMPT
         return ""
 
+    def _sanitize_publish_output_text(self, text: str) -> str:
+        """净化发布文本，去除 emoji 与装饰性符号。"""
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return ""
+
+        # 去除 emoji（主要位于补充平面）
+        cleaned = re.sub(r"[\U00010000-\U0010FFFF]", "", cleaned)
+        # 去除非常规装饰字符，保留常用中英文、数字与中文标点
+        cleaned = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9，。！？、；：‘’“”（）《》【】…—\-\s]", "", cleaned)
+        # 归一化标点与空白
+        cleaned = re.sub(r"[~～]{1,}", "", cleaned)
+        cleaned = re.sub(r"[！!]{2,}", "！", cleaned)
+        cleaned = re.sub(r"[？?]{2,}", "？", cleaned)
+        cleaned = " ".join(cleaned.split())
+
+        return cleaned.strip()
+
     async def _rewrite_publish_content_with_persona(self, content: str) -> str:
         """发布说说前按人设/风格进行改写。"""
         raw_text = str(content or "").strip()
@@ -2444,7 +2463,8 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
             "- 避免与最近发布内容语义重复\n"
             "- 长度建议 28~80 字\n"
             "- 至少包含两个信息点（如：场景+感受 / 事件+观点）\n"
-            "- 避免过短口号式表达"
+            "- 避免过短口号式表达\n"
+            "- 禁止使用 Emoji、颜文字、装饰符号（如 ✨🌸~）"
         )
 
         try:
@@ -2452,6 +2472,11 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
             if text:
                 rewritten_text = str(text).strip()
                 if rewritten_text:
+                    rewritten_text = self._sanitize_publish_output_text(rewritten_text)
+                    if not rewritten_text:
+                        self._log("debug", "[发布改写]", "改写结果经净化后为空，回退原文")
+                        return raw_text
+
                     if len(rewritten_text) < 24:
                         self._log(
                             "debug",
