@@ -1941,7 +1941,12 @@ class QzoneService(BaseService):
                             monitor_stats["like_success"] += 1
                         elif like_result is False:
                             monitor_stats["like_failed"] += 1
-                    
+
+                    # 盖楼互动：处理该动态下的现有评论（可选，复用 auto_reply_probability）
+                    feed_comments = item.get("comments", [])
+                    if feed_comments:
+                        await self._process_feed_comments(item, feed_comments, current_qq=current_qq)
+
                     processed_count += 1
                     
                     # 批量处理间隔：每条说说间增加 3-8 秒随机延迟
@@ -2013,7 +2018,7 @@ class QzoneService(BaseService):
         logger.info(f"[说说监控] 检测到手动触发({source})，监控计时已重置（{interval}s）")
 
     async def _check_and_reply_own_feed_comments(self, qq_number: str) -> None:
-        """检查自己说说的评论并回复"""
+        """检查自己说说的评论并回复（含二级盖楼回复）"""
         self._log("info", "[评论回复]", f"开始检查 QQ={qq_number} 的说说评论...")
 
         # 获取自己最近的说说
@@ -2045,10 +2050,25 @@ class QzoneService(BaseService):
                 or str(feed.get("time", "") or "").strip()
             )
 
+            # 扁平化评论列表：包含主评论 + 二级盖楼回复
+            flattened_comments = []
+            for c in comments:
+                c_copy = dict(c)
+                c_copy["is_nested"] = False
+                flattened_comments.append(c_copy)
+
+                # 提取二级回复（QQ空间 API 通常存放在 list_3 或 replylist 中）
+                nested_list = c.get("list_3") or c.get("replylist") or []
+                for nc in nested_list:
+                    nc_copy = dict(nc)
+                    nc_copy["is_nested"] = True
+                    nc_copy["parent_id"] = c.get("id") or c.get("cid")
+                    flattened_comments.append(nc_copy)
+
             await self._reply_to_comments(
                 tid=tid,
                 story_content=content or rt_content or "说说内容",
-                comments=comments,
+                comments=flattened_comments,
                 images=images,
                 qq_number=qq_number,
                 story_time=story_time,
@@ -2150,6 +2170,83 @@ class QzoneService(BaseService):
             finally:
                 # 无论成功与否，都解除锁定
                 self._log("debug", "[评论回复]", f"解锁评论: {comment_key}")
+                if comment_key in self._processing_comments:
+                    self._processing_comments.remove(comment_key)
+
+    async def _process_feed_comments(self, item: dict, comments: list, *, current_qq: str | None = None) -> None:
+        """处理好友动态下的现有评论（盖楼互动）
+
+        Args:
+            item: 好友动态数据项
+            comments: 评论列表
+            current_qq: 当前登录QQ号
+        """
+        tid = item.get("tid")
+        if not tid:
+            return
+
+        owner_qq = str(item.get("uin", "") or "").strip() or None
+        normalized_current_qq = str(current_qq or "").strip() or None
+
+        for comment in comments:
+            comment_uin = str(comment.get("qq_account") or comment.get("uin", ""))
+            if normalized_current_qq and comment_uin == normalized_current_qq:
+                continue  # 跳过自己的评论
+
+            comment_id = str(comment.get("comment_tid") or comment.get("id", ""))
+            if not comment_id:
+                continue
+
+            if self._has_replied_comment(tid, comment_id):
+                continue
+
+            # 并发锁
+            comment_key = f"{tid}_feed_{comment_id}"
+            if comment_key in self._processing_comments:
+                self._log("debug", "[盖楼互动]", f"评论 {comment_key} 正在处理中，跳过")
+                continue
+
+            self._log("debug", "[盖楼互动]", f"锁定待回复评论: {comment_key}")
+            self._processing_comments.add(comment_key)
+
+            try:
+                # 复用自动回复概率
+                monitor_cfg = getattr(self.config, "monitor", None)
+                reply_probability = float(getattr(monitor_cfg, "auto_reply_probability", 0.9)) if monitor_cfg else 0.9
+                if random.random() > reply_probability:
+                    self._log("debug", "[盖楼互动]", f"概率未命中，跳过回复 tid={tid}")
+                    continue
+
+                nickname = comment.get("nickname", "网友")
+                content = comment.get("content", "")
+                self._log("info", "[盖楼互动]", f"发现可回复评论: {nickname}: {content}")
+
+                reply_text = await self._generate_comment_reply(
+                    story_content=item.get("content", ""),
+                    comment_content=content,
+                    commenter_name=nickname,
+                    commenter_qq=comment_uin,
+                    images=[p.get("url") for p in item.get("pic", [])],
+                    story_time=str(item.get("createTime", "")),
+                    comment_time="",
+                )
+
+                if reply_text:
+                    await self._random_human_delay(2.0, 6.0, "[盖楼互动]")
+                    res = await self.comment_shuoshuo(
+                        shuoshuo_id=tid,
+                        content=reply_text,
+                        qq_number="",
+                        owner_qq=owner_qq,
+                        comment_id=comment_id,
+                    )
+                    if res.is_success:
+                        self._mark_comment_replied(tid, comment_id)
+                        self._log("info", "[盖楼互动]", f"回复成功: {reply_text}")
+                    else:
+                        self._log("warning", "[盖楼互动]", f"回复失败: {res.error_message}")
+            finally:
+                self._log("debug", "[盖楼互动]", f"解锁评论: {comment_key}")
                 if comment_key in self._processing_comments:
                     self._processing_comments.remove(comment_key)
 
@@ -2294,6 +2391,7 @@ QQ空间是中文社交平台，用户通过“说说”记录日常，好友会
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(url)
             if resp.status_code >= 400 or not resp.content:
+                self._log("warning", "[VLM识图]", f"下载图片失败或为空: {url} (Status: {resp.status_code})")
                 return None
 
             from src.app.plugin_system.api import media_api
@@ -2305,15 +2403,18 @@ QQ空间是中文社交平台，用户通过“说说”记录日常，好友会
                 use_cache=True,
             )
             if not description:
+                self._log("warning", "[VLM识图]", "API 返回内容为空")
                 return None
 
             text = str(description).strip()
             if not text:
+                self._log("warning", "[VLM识图]", "API 返回文本为空")
                 return None
 
+            self._log("info", "[VLM识图]", f"识别成功: {text[:50]}...")
             return text[:120]
         except Exception as e:
-            self._log("debug", "[VLM识图]", f"识别失败: {e}")
+            self._log("warning", "[VLM识图]", f"识别异常: {e}")
             return None
 
     async def _build_image_context_block(self, images: list[str] | None) -> str:
@@ -3218,24 +3319,39 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
             self._monitor_running = True
             logger.info(f"[自动监控] 已启动，间隔 {interval} 秒")
 
-            # 启动后立即执行一轮（最高优先级）：
-            # - 已在启动流程中重置冷却计时
-            # - 首轮强制执行，跳过静默/冷却检查
-            # - 已读/基线机制仍保留，避免历史刷屏
-            try:
-                startup_result = await self._run_auto_monitor(force=True, source="startup_immediate")
-                if startup_result == "skip_no_qq":
-                    retry_max_attempts = int(config.get("startup_retry_max_attempts", 6) or 6)
-                    retry_interval = int(config.get("startup_retry_interval", 10) or 10)
-                    retry_max_attempts = max(1, min(retry_max_attempts, 60))
-                    retry_interval = max(5, min(retry_interval, 300))
-                    await self._schedule_startup_retry(
-                        max_attempts=retry_max_attempts,
-                        interval_seconds=retry_interval,
-                        reason="startup_no_qq",
-                    )
-            except Exception as immediate_err:
-                logger.warning(f"[自动监控] 启动即执行首轮失败（已忽略，不影响后续定时监控）: {immediate_err}")
+            # 启动后智能等待连接就绪，再执行首轮（避免适配器未就绪导致的无效报错）
+            startup_result = "unknown"
+            connection_ready = False
+            
+            # 最多等待 15 秒 (3次 * 5s)，直到适配器返回 QQ 号
+            for attempt in range(3):
+                current_qq = await self.get_current_uin()
+                if current_qq:
+                    connection_ready = True
+                    if attempt > 0:
+                        logger.info(f"[自动监控] 适配器连接就绪 (尝试了 {attempt + 1} 次)")
+                    break
+                if attempt < 2:
+                    logger.info(f"[自动监控] 等待适配器连接... (尝试 {attempt + 1}/3)")
+                    await asyncio.sleep(5)
+
+            if connection_ready:
+                try:
+                    startup_result = await self._run_auto_monitor(force=True, source="startup_immediate")
+                except Exception as immediate_err:
+                    startup_result = f"error: {immediate_err}"
+                    logger.warning(f"[自动监控] 首轮执行异常 (已忽略，不影响后续定时任务): {immediate_err}")
+
+            if not connection_ready or startup_result == "skip_no_qq":
+                retry_max_attempts = int(config.get("startup_retry_max_attempts", 6) or 6)
+                retry_interval = int(config.get("startup_retry_interval", 10) or 10)
+                retry_max_attempts = max(1, min(retry_max_attempts, 60))
+                retry_interval = max(5, min(retry_interval, 300))
+                await self._schedule_startup_retry(
+                    max_attempts=retry_max_attempts,
+                    interval_seconds=retry_interval,
+                    reason="startup_no_qq",
+                )
 
             return {
                 "success": True,
