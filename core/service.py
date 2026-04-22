@@ -1606,8 +1606,9 @@ class QzoneService(BaseService):
         qq_number: str = "",
         owner_qq: str | None = None,
         comment_id: str | None = None,
+        parent_tid: str | None = None,
     ) -> "Result[dict]":
-        """评论说说
+        """评论说说（支持盖楼式多级回复）
 
         Args:
             shuoshuo_id: 说说 ID (tid)
@@ -1615,6 +1616,9 @@ class QzoneService(BaseService):
             qq_number: 评论者 QQ 号（留空则自动获取）
             owner_qq: 说说作者 QQ 号
             comment_id: 回复的评论 ID（可选，用于回复他人评论）
+            parent_tid: 父评论 ID（可选，用于二级回复时指定盖楼位置）
+                       - 如果是回复一级评论：comment_id=一级评论ID, parent_tid=None
+                       - 如果是回复二级评论：comment_id=二级评论ID, parent_tid=一级评论ID
         """
         logger.info(f"[评论说说] 开始执行, tid={shuoshuo_id}, qq={qq_number or '自动获取'}, owner={owner_qq}")
 
@@ -1662,9 +1666,9 @@ class QzoneService(BaseService):
 
         # 如果是回复评论，添加相关参数
         if comment_id:
-            post_data["commentid"] = comment_id # 注意：参考插件中这个字段可能是 parent_tid 或通过 content 拼接，但我们先保持协议一致
-            # 在某些接口下，回复他人需要指定 parent_tid
-            post_data["parent_tid"] = comment_id
+            post_data["commentid"] = comment_id
+            # 如果指定了 parent_tid，说明是回复二级评论，需要         # 否则直接回复该评论（一级评论）
+            post_data["parent_tid"] = parent_tid if parent_tid else comment_id
             post_data["topicId"] = f"{target_owner}_{shuoshuo_id}__1" # 接口要求
         
         try:
@@ -1710,7 +1714,7 @@ class QzoneService(BaseService):
                         if client_info:
                             return await self._retry_comment(
                                 client_info[0], client_info[1], client_info[2],
-                                shuoshuo_id, content, owner_qq, comment_id
+                                shuoshuo_id, content, owner_qq, comment_id, parent_tid
                             )
                         return Result.fail("Cookie 失效，刷新失败")
                     else:
@@ -1750,7 +1754,7 @@ class QzoneService(BaseService):
                 if client_info:
                     return await self._retry_comment(
                         client_info[0], client_info[1], client_info[2],
-                        shuoshuo_id, content, owner_qq, comment_id
+                        shuoshuo_id, content, owner_qq, comment_id, parent_tid
                     )
                 return Result.fail("Cookie 已失效，刷新失败")
             else:
@@ -1766,7 +1770,8 @@ class QzoneService(BaseService):
 
     async def _retry_comment(
         self, client: httpx.AsyncClient, uin: str, gtk: str,
-        shuoshuo_id: str, content: str, owner_qq: str | None, comment_id: str | None
+        shuoshuo_id: str, content: str, owner_qq: str | None, 
+        comment_id: str | None, parent_tid: str | None = None
     ) -> "Result[dict]":
         """重试评论说说"""
         target_owner = owner_qq if owner_qq else uin
@@ -1786,7 +1791,7 @@ class QzoneService(BaseService):
 
         if comment_id:
             post_data["commentid"] = comment_id
-            post_data["parent_tid"] = comment_id
+            post_data["parent_tid"] = parent_tid if parent_tid else comment_id
 
         try:
             logger.info(f"[重试评论] 发送请求, topicId={post_data['topicId']}")
@@ -2309,7 +2314,8 @@ class QzoneService(BaseService):
                         content=reply_text,
                         qq_number="",
                         owner_qq=owner_qq,
-                        comment_id=comment_id,  # 回复到该评论下（支持一级和二级）
+                        comment_id=comment_id,
+                        parent_tid=parent_tid,  # 传递 parent_tid，支持正确盖楼
                     )
                     if res.is_success:
                         self._mark_comment_replied(tid, comment_id)
