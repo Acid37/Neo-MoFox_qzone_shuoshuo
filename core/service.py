@@ -210,13 +210,24 @@ class QzoneService(BaseService):
         确保 WebSocket 已连接且响应正常，再回退到读取缓存。
         """
         try:
-            from src.core.managers.adapter_manager import get_adapter_manager
+            from src.app.plugin_system.api import adapter_api
 
-            # 获取 QQ 适配器实例
-            adapter = get_adapter_manager().get_adapter("qq")
+            # 适配器签名（符合 Neo 规范：plugin_name:component_type:component_name）
+            adapter_signature = "napcat_adapter:adapter:napcat_adapter"
             
-            # 1. 主动探测：尝试调用底层 API 验证连接
-            if adapter and hasattr(adapter, "send_napcat_api"):
+            # 1. 检查适配器是否已启动
+            if not adapter_api.is_adapter_active(adapter_signature):
+                self._log("debug", "[NapCat探测]", "适配器未启动")
+                return None
+            
+            # 2. 获取适配器实例
+            adapter = adapter_api.get_adapter(adapter_signature)
+            if not adapter:
+                self._log("warning", "[NapCat探测]", "无法获取适配器实例")
+                return None
+            
+            # 3. 主动探测：尝试调用底层 API 验证连接
+            if hasattr(adapter, "send_napcat_api"):
                 try:
                     res = await adapter.send_napcat_api("get_login_info", {})
                     if res and res.get("status") == "ok":
@@ -225,22 +236,22 @@ class QzoneService(BaseService):
                             logger.info(f"[NapCat探测] 连接验证成功，获取到 QQ: {qq_id}")
                             return str(qq_id)
                 except Exception as probe_err:
-                    logger.debug(f"[NapCat探测] 主动探测失败，回退到缓存读取: {probe_err}")
+                    self._log("debug", "[NapCat探测]", f"主动探测失败，回退到缓存读取: {probe_err}")
             else:
                 # 适配器版本较旧，不支持实时探测
                 self._log("debug", "[NapCat探测]", "当前适配器不支持实时探测 (send_napcat_api)，已回退到缓存模式")
 
-            # 2. 回退机制：读取适配器缓存信息（兼容旧版本适配器）
-            bot_info = await get_adapter_manager().get_bot_info_by_platform("qq")
+            # 4. 回退机制：通过 get_bot_info() 获取（兼容旧版本适配器）
+            bot_info = await adapter.get_bot_info()
             if bot_info:
                 qq_id = bot_info.get("bot_id")
                 if qq_id:
                     logger.info(f"[NapCat缓存] 读取到缓存 QQ: {qq_id}")
                     return str(qq_id)
             
-            logger.warning("未能从 NapCat 获取 QQ 号信息")
+            logger.warning("[NapCat探测] 未能获取 QQ 号信息")
         except Exception as e:
-            logger.error(f"从 NapCat 获取 QQ 号失败: {e}")
+            logger.error(f"[NapCat探测] 异常: {e}")
         return None
 
     def _load_state(self) -> None:
@@ -1028,6 +1039,34 @@ class QzoneService(BaseService):
         text = " ".join(text.split())
         return text.strip()
 
+    def _normalize_image_url(self, url: str) -> str:
+        """规范化图片 URL，补全协议头。
+        
+        处理 QQ 空间常见的 URL 格式：
+        - //qpic.cn/xxx → https://qpic.cn/xxx
+        - /path/xxx → https://qzonestyle.gtimg.cn/path/xxx
+        - qpic.cn/xxx → https://qpic.cn/xxx
+        """
+        url = url.strip()
+        if not url:
+            return ""
+        
+        # 协议相对路径
+        if url.startswith("//"):
+            return f"https:{url}"
+        
+        # 绝对路径
+        if url.startswith("/"):
+            return f"https://qzonestyle.gtimg.cn{url}"
+        
+        # 无协议的域名
+        if not url.startswith(("http://", "https://")):
+            # 检查是否是 QQ 空间常见域名
+            if any(domain in url for domain in ["qpic.cn", "qlogo.cn", "gtimg.cn"]):
+                return f"https://{url}"
+        
+        return url
+
     def _extract_image_urls_from_feed_html(self, html_content: str) -> list[str]:
         """从好友动态 HTML 片段中提取图片 URL 列表。
         
@@ -1054,16 +1093,18 @@ class QzoneService(BaseService):
                         if isinstance(img, Tag):
                             src = img.get("src")
                             if src and isinstance(src, str) and "qzonestyle.gtimg.cn" not in src:
-                                if src not in urls:
-                                    urls.append(src)
+                                normalized = self._normalize_image_url(src)
+                                if normalized and normalized not in urls:
+                                    urls.append(normalized)
                 
                 # 提取视频封面
                 video_thumb = soup.select_one("div.video-img img")
                 if isinstance(video_thumb, Tag) and "src" in video_thumb.attrs:
                     src = video_thumb["src"]
                     if src and isinstance(src, str) and "qzonestyle.gtimg.cn" not in src:
-                        if src not in urls:
-                            urls.append(src)
+                        normalized = self._normalize_image_url(src)
+                        if normalized and normalized not in urls:
+                            urls.append(normalized)
                 
                 if urls:
                     return urls
@@ -1078,9 +1119,9 @@ class QzoneService(BaseService):
                 continue
             if "qzonestyle.gtimg.cn" in cleaned:
                 continue
-            if cleaned in urls:
-                continue
-            urls.append(cleaned)
+            normalized = self._normalize_image_url(cleaned)
+            if normalized and normalized not in urls:
+                urls.append(normalized)
         return urls
 
     async def _get_friend_feed_list(self, count: int = 20) -> "Result[list[dict]]":
@@ -2198,11 +2239,11 @@ class QzoneService(BaseService):
                     self._processing_comments.remove(comment_key)
 
     async def _process_feed_comments(self, item: dict, comments: list, *, current_qq: str | None = None) -> None:
-        """处理好友动态下的现有评论（盖楼互动）
+        """处理好友动态下的现有评论（支持多级盖楼互动）
 
         Args:
             item: 好友动态数据项
-            comments: 评论列表
+            comments: 评论列表（已包含一级评论和二级回复）
             current_qq: 当前登录QQ号
         """
         tid = item.get("tid")
@@ -2243,7 +2284,13 @@ class QzoneService(BaseService):
 
                 nickname = comment.get("nickname", "网友")
                 content = comment.get("content", "")
-                self._log("info", "[盖楼互动]", f"发现可回复评论: {nickname}: {content}")
+                parent_tid = comment.get("parent_tid")  # 识别是否为二级回复
+                
+                # 区分一级评论和二级回复
+                if parent_tid:
+                    self._log("info", "[盖楼互动]", f"发现二级回复: {nickname}: {content}")
+                else:
+                    self._log("info", "[盖楼互动]", f"发现一级评论: {nickname}: {content}")
 
                 reply_text = await self._generate_comment_reply(
                     story_content=item.get("content", ""),
@@ -2262,11 +2309,12 @@ class QzoneService(BaseService):
                         content=reply_text,
                         qq_number="",
                         owner_qq=owner_qq,
-                        comment_id=comment_id,
+                        comment_id=comment_id,  # 回复到该评论下（支持一级和二级）
                     )
                     if res.is_success:
                         self._mark_comment_replied(tid, comment_id)
-                        self._log("info", "[盖楼互动]", f"回复成功: {reply_text}")
+                        level_text = "二级回复" if parent_tid else "一级评论"
+                        self._log("info", "[盖楼互动]", f"{level_text}回复成功: {reply_text}")
                     else:
                         self._log("warning", "[盖楼互动]", f"回复失败: {res.error_message}")
             finally:
@@ -2406,51 +2454,81 @@ QQ空间是中文社交平台，用户通过“说说”记录日常，好友会
         return template
 
     async def _describe_image_with_vlm(self, image_url: str) -> str | None:
-        """使用 VLM 识别图片语义描述。"""
+        """使用 VLM 识别图片语义描述（增强错误处理）。"""
         url = str(image_url).strip()
         if not url:
             return None
 
-        # 1. 修复 QQ 空间常见的协议相对路径 (//...)
+        # 1. 修复 QQ 空间常见的 URL 格式问题
+        # 协议相对路径 (//...)
         if url.startswith("//"):
             url = "https:" + url
+        # 相对路径 (/xxx)
+        elif url.startswith("/"):
+            url = "https://qzonestyle.gtimg.cn" + url
+        # 无协议的域名 (qpic.cn/xxx)
+        elif not url.startswith(("http://", "https://")):
+            # 检查是否是 QQ 空间常见域名
+            if any(domain in url for domain in ["qpic.cn", "qlogo.cn", "gtimg.cn"]):
+                url = "https://" + url
+            else:
+                self._log("warning", "[VLM识图]", f"无效协议: {url[:50]}")
+                return None
         
-        # 2. 严格检查协议头 (兼容大小写)
-        # 如果不是 http/https 开头，直接跳过，防止 httpx 报错
+        # 2. 最终验证协议头
         if not url.lower().startswith(("http://", "https://")):
-            self._log("warning", "[VLM识图]", f"忽略无效协议链接: {url[:50]}...")
+            self._log("warning", "[VLM识图]", f"无效协议: {url[:50]}")
             return None
 
         try:
-            # 打印实际请求的 URL，方便排查隐形字符问题
-            self._log("debug", "[VLM识图]", f"正在请求图片: {url[:60]}...")
+            # 3. 下载图片（详细错误分类）
+            self._log("debug", "[VLM识图]", f"下载图片: {url[:60]}")
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(url)
-            if resp.status_code >= 400 or not resp.content:
-                self._log("warning", "[VLM识图]", f"下载图片失败或为空: {url} (Status: {resp.status_code})")
+            
+            # 检查 HTTP 状态码
+            if resp.status_code >= 400:
+                self._log("warning", "[VLM识图]", f"下载失败 HTTP {resp.status_code}: {url[:60]}")
                 return None
-
+            
+            # 检查内容是否为空
+            if not resp.content:
+                self._log("warning", "[VLM识图]", f"图片内容为空: {url[:60]}")
+                return None
+            
+            # 4. 调用识别 API
             from src.app.plugin_system.api import media_api
-
+            
             base64_data = base64.b64encode(resp.content).decode("utf-8")
+            self._log("debug", "[VLM识图]", f"调用识别API，数据大小: {len(base64_data)} bytes")
+            
             description = await media_api.recognize_media(
                 base64_data=base64_data,
                 media_type="image",
                 use_cache=True,
             )
+            
+            # 5. 验证识别结果
             if not description:
-                self._log("warning", "[VLM识图]", "API 返回内容为空")
+                self._log("warning", "[VLM识图]", f"API返回空结果: {url[:60]}")
                 return None
 
             text = str(description).strip()
             if not text:
-                self._log("warning", "[VLM识图]", "API 返回文本为空")
+                self._log("warning", "[VLM识图]", f"识别文本为空: {url[:60]}")
                 return None
 
             self._log("info", "[VLM识图]", f"识别成功: {text[:50]}...")
             return text[:120]
+            
+        except httpx.TimeoutException:
+            self._log("warning", "[VLM识图]", f"下载超时: {url[:60]}")
+            return None
+        except httpx.HTTPError as e:
+            self._log("warning", "[VLM识图]", f"HTTP错误: {type(e).__name__}: {e}")
+            return None
         except Exception as e:
-            self._log("warning", "[VLM识图]", f"识别异常: {e}")
+            self._log("error", "[VLM识图]", f"未知异常: {type(e).__name__}: {e}")
             return None
 
     async def _build_image_context_block(self, images: list[str] | None) -> str:
@@ -3323,8 +3401,10 @@ QQ空间是中文社交平台，用户通过“说说”记录生活，好友可
                 if current_qq:
                     # 尝试验证连接
                     try:
-                        from src.core.managers.adapter_manager import get_adapter_manager
-                        adapter = get_adapter_manager().get_adapter("qq")
+                        from src.app.plugin_system.api import adapter_api
+                        
+                        adapter_signature = "napcat_adapter:adapter:napcat_adapter"
+                        adapter = adapter_api.get_adapter(adapter_signature)
                         
                         if adapter and hasattr(adapter, "send_napcat_api"):
                             # 支持探测：必须探测通过才算就绪
