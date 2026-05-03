@@ -4,6 +4,9 @@
 Cookie 可能会刷新失效，因此需要定期检查。
 """
 
+from __future__ import annotations
+
+import asyncio
 import json
 from pathlib import Path
 
@@ -14,8 +17,6 @@ from src.app.plugin_system.api.log_api import get_logger
 
 logger = get_logger("qzone_shuoshuo")
 
-# QQ空间 Cookie 失效的错误码
-COOKIE_EXPIRED_CODE = -3000
 
 
 class CookieManager:
@@ -42,7 +43,7 @@ class CookieManager:
             qq: QQ号
 
         Returns:
-            Cookie 字典或 None
+            Cookie 字典或 None（文件不存在、格式损坏或字段不完整时返回 None）
         """
         path = self._get_cookie_path(qq)
         if not path.exists():
@@ -51,7 +52,15 @@ class CookieManager:
         try:
             async with aiofiles.open(path, "r", encoding="utf-8") as f:
                 content = await f.read()
-                return json.loads(content)
+                cookies = json.loads(content)
+
+            if not self._validate_cookies(cookies):
+                logger.warning(
+                    f"[Cookie校验] QQ:{qq} 本地 Cookie 缺少必需字段(p_skey/uin)，视为无效"
+                )
+                return None
+
+            return cookies
         except Exception as e:
             logger.error(f"加载 Cookie 失败 {qq}: {e}")
             return None
@@ -73,7 +82,7 @@ class CookieManager:
             logger.error(f"保存 Cookie 失败 {qq}: {e}")
 
     async def fetch_cookies_from_adapter(self, adapter_sign: str) -> dict[str, str] | None:
-        """从适配器获取 Cookie
+        """从适配器获取 Cookie（含退避重试，应对适配器偶发超时/消息丢失）。
 
         Args:
             adapter_sign: 适配器签名
@@ -81,34 +90,52 @@ class CookieManager:
         Returns:
             Cookie 字典或 None
         """
-        try:
-            result = await adapter_api.send_adapter_command(
-                adapter_sign=adapter_sign,
-                command_name="get_cookies",
-                command_data={"domain": "user.qzone.qq.com"},
-                timeout=20.0,
-            )
+        max_retries = 3
+        last_error: str | None = None
 
-            if result.get("status") == "ok":
-                data = result.get("data", {})
-                cookie_str = data.get("cookies", "")
-                if cookie_str:
-                    return self._parse_cookie_str(cookie_str)
-            else:
-                # 区分“等待连接”与“真实错误”
+        for attempt in range(max_retries):
+            try:
+                result = await adapter_api.send_adapter_command(
+                    adapter_sign=adapter_sign,
+                    command_name="get_cookies",
+                    command_data={"domain": "user.qzone.qq.com"},
+                    timeout=20.0,
+                )
+
+                if result.get("status") == "ok":
+                    data = result.get("data", {})
+                    cookie_str = data.get("cookies", "")
+                    if cookie_str:
+                        cookies = self._parse_cookie_str(cookie_str)
+                        if attempt > 0:
+                            logger.info(f"[Cookie获取] 第 {attempt + 1} 次重试成功")
+                        return cookies
+
+                # 区分"等待连接"与"真实错误"
                 msg = str(result)
                 if "连接未建立" in msg or "WebSocket" in msg:
-                    logger.warning(f"适配器未连接，获取 Cookie 失败 (等待连接中): {result}")
+                    last_error = "适配器连接未建立"
+                    logger.warning(f"[Cookie获取] 适配器未连接 (尝试 {attempt + 1}/{max_retries})")
                 else:
-                    logger.warning(f"适配器返回错误: {result}")
-        except Exception as e:
-            err_msg = str(e)
-            # 区分“等待连接”与“真实错误”
-            if "连接未建立" in err_msg or "WebSocket" in err_msg:
-                logger.warning(f"适配器未连接，获取 Cookie 失败 (等待连接中): {e}")
-            else:
-                logger.error(f"从适配器获取 Cookie 失败: {e}")
+                    last_error = str(result.get("message", result))
+                    logger.warning(
+                        f"[Cookie获取] 适配器返回错误 (尝试 {attempt + 1}/{max_retries}): {last_error}"
+                    )
 
+            except Exception as e:
+                last_error = str(e)
+                err_msg = str(e)
+                if "连接未建立" in err_msg or "WebSocket" in err_msg:
+                    logger.warning(f"[Cookie获取] 适配器未连接 (尝试 {attempt + 1}/{max_retries}): {e}")
+                else:
+                    logger.error(f"[Cookie获取] 异常 (尝试 {attempt + 1}/{max_retries}): {e}")
+
+            if attempt < max_retries - 1:
+                delay = 2 ** attempt
+                logger.info(f"[Cookie获取] 等待 {delay}s 后重试...")
+                await asyncio.sleep(delay)
+
+        logger.error(f"[Cookie获取] 已重试 {max_retries} 次，全部失败，最后错误: {last_error}")
         return None
 
     def _parse_cookie_str(self, cookie_str: str) -> dict[str, str]:
@@ -127,6 +154,33 @@ class CookieManager:
                 cookies[k.strip()] = v.strip()
         return cookies
 
+    @staticmethod
+    def _validate_cookies(cookies: dict[str, str]) -> bool:
+        """校验 Cookie 字典是否包含必需的完整字段。
+
+        必须同时满足：
+        - 含有 p_skey 或 skey 字段（用于计算 GTK 签名）且非空
+        - 含有 uin 或 ptui_loginuin 字段（用于标识用户）且非空
+
+        Args:
+            cookies: Cookie 字典
+
+        Returns:
+            True 表示 Cookie 完整性校验通过
+        """
+        if not isinstance(cookies, dict) or not cookies:
+            return False
+
+        has_skey = bool(
+            (cookies.get("p_skey") or cookies.get("P_skey") or "").strip()
+            or (cookies.get("skey") or cookies.get("Skey") or "").strip()
+        )
+        has_uin = bool(
+            (cookies.get("uin") or cookies.get("ptui_loginuin") or "").strip()
+        )
+
+        return has_skey and has_uin
+
     async def get_cookies(self, qq: str, adapter_sign: str = "") -> dict[str, str] | None:
         """获取 Cookie（优先本地，失败则尝试适配器）
 
@@ -142,13 +196,17 @@ class CookieManager:
         if cookies:
             return cookies
 
-        # 2. 尝试从适配器获取
+        # 2. 尝试从适配器获取（内部已含退避重试）
         if adapter_sign:
-            logger.info(f"本地无 Cookie，尝试从适配器 {adapter_sign} 获取...")
+            logger.info(f"本地无有效 Cookie，尝试从适配器 {adapter_sign} 获取...")
             cookies = await self.fetch_cookies_from_adapter(adapter_sign)
-            if cookies:
+            if cookies and self._validate_cookies(cookies):
                 await self.save_cookies(qq, cookies)
                 return cookies
+            if cookies:
+                logger.warning(
+                    "[Cookie获取] 适配器返回的 Cookie 不完整(缺少 p_skey/uin)，已丢弃"
+                )
 
         return None
 
@@ -180,13 +238,21 @@ class CookieManager:
             adapter_sign: 适配器签名
 
         Returns:
-            新 Cookie 字典或 None
+            新 Cookie 字典或 None（刷新失败或返回的 Cookie 不完整时返回 None）
         """
         logger.info(f"[Cookie刷新] 正在从适配器刷新 QQ:{qq} 的 Cookie...")
         cookies = await self.fetch_cookies_from_adapter(adapter_sign)
-        if cookies:
-            await self.save_cookies(qq, cookies)
-            logger.info("[Cookie刷新] 成功获取新 Cookie")
-            return cookies
-        logger.error("[Cookie刷新] 从适配器获取新 Cookie 失败")
-        return None
+        if not cookies:
+            logger.error("[Cookie刷新] 从适配器获取新 Cookie 失败")
+            return None
+
+        if not self._validate_cookies(cookies):
+            logger.error(
+                "[Cookie刷新] 获取到的 Cookie 不完整(缺少 p_skey/uin)，"
+                "已丢弃，不写入本地以避免毒缓存"
+            )
+            return None
+
+        await self.save_cookies(qq, cookies)
+        logger.info("[Cookie刷新] 成功获取并保存新 Cookie")
+        return cookies

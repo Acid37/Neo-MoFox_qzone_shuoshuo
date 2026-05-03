@@ -286,7 +286,7 @@ class QzoneService(BaseService):
         qq = await self._get_qq_from_napcat()
         if not qq:
             return False
-        cookies = await self.cookie_manager.load_cookies(qq)
+        cookies = await self.cookie_manager.get_cookies(qq, ADAPTER_SIGNATURE)
         return bool(cookies)
 
     async def get_qq_suggestion(self) -> str:
@@ -306,14 +306,17 @@ class QzoneService(BaseService):
         """从 NapCat 获取并保存 Cookie"""
         logger.info("[Cookie更新] 开始从 NapCat 获取 Cookie")
         cookies = await self.cookie_manager.fetch_cookies_from_adapter(ADAPTER_SIGNATURE)
-        if cookies:
-            uin = cookies.get("uin") or cookies.get("ptui_loginuin")
-            if uin:
-                real_uin = uin.lstrip("o")
-                await self.cookie_manager.save_cookies(real_uin, cookies)
-                logger.info(f"[Cookie更新] 成功获取并保存 Cookie, QQ={real_uin}")
-                return real_uin
-        logger.warning("[Cookie更新] 未能获取 Cookie")
+        if not cookies or not self.cookie_manager._validate_cookies(cookies):
+            logger.warning("[Cookie更新] 获取到的 Cookie 无效或不完整，已丢弃")
+            return None
+
+        uin = cookies.get("uin") or cookies.get("ptui_loginuin")
+        if uin:
+            real_uin = uin.lstrip("o")
+            await self.cookie_manager.save_cookies(real_uin, cookies)
+            logger.info(f"[Cookie更新] 成功获取并保存 Cookie, QQ={real_uin}")
+            return real_uin
+        logger.warning("[Cookie更新] Cookie 中缺少 uin")
         return None
 
     # ---- 资源清理 ----
